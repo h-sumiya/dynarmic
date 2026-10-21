@@ -94,8 +94,7 @@ native and index hits do not acquire that lock.
 Bounded traces remove internal branch dispatch and allow constant propagation
 and register get/set elimination across the joined instructions. Arithmetic
 selection uses x86 signed 32-bit immediates when the full 64-bit value is
-representable. The register allocator can move a live value to an unused
-register before spilling it to the stack.
+representable. The register allocator spills displaced live values to the stack.
 
 A conservative pure self-loop path keeps up to two guest GPRs in host registers.
 External entries load them, self-edges retain them, and every exit materializes
