@@ -352,8 +352,12 @@ bool Exclusive(A64JitState* state, const BaselineMemoryOp& op, u64 address) {
         return true;
     }
 
+    // Both tiers publish reservations to the same global monitor. Its address,
+    // width and epoch checks also cover loads emitted by the optimizing tier,
+    // which do not populate the baseline-only fallback fields.
     const bool reserved = state->exclusive_state != 0 &&
-        state->baseline_exclusive_address == address && state->baseline_exclusive_size == sizeof(T);
+        (config.global_monitor || (state->baseline_exclusive_address == address &&
+                                   state->baseline_exclusive_size == sizeof(T)));
     state->exclusive_state = 0;
     state->baseline_exclusive_size = 0;
     if (op.release)
