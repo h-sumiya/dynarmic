@@ -19,8 +19,6 @@ BaselineReclamation A64EmitX64::PrepareBaselineEmission(size_t body_size) {
     const auto required = body_size + entry_reserve;
     const auto cursor = baseline_cache.Prepare(required, [&](const A64BaselineCodeCache::Segment& segment) {
         result.evicted_locations.reserve(segment.allocations.size());
-        tsl::robin_set<IR::LocationDescriptor> locations;
-        locations.reserve(segment.allocations.size());
         // Baseline-only emitters have no outgoing direct patches or inline
         // sites. Native lookup helpers stay executable throughout this batch;
         // avoid a W^X protection transition for each retired block.
@@ -30,7 +28,6 @@ BaselineReclamation A64EmitX64::PrepareBaselineEmission(size_t body_size) {
             const auto entrypoint = reinterpret_cast<CodePtr>(allocation.entrypoint);
             const auto current = block_descriptors.find(location);
             if (current != block_descriptors.end() && current->second.entrypoint == entrypoint) {
-                locations.insert(location);
                 result.evicted_locations.push_back(allocation.location);
                 block_descriptors.erase(current);
             }
@@ -46,7 +43,7 @@ BaselineReclamation A64EmitX64::PrepareBaselineEmission(size_t body_size) {
                 patch_information.erase(patch);
             }
         }
-        block_ranges.RemoveLocations(locations);
+        block_ranges.RemoveLocations(result.evicted_locations);
         for (const auto rip : segment.fault_rips)
             fastmem_patch_info.erase(rip);
         result.reclaimed_blocks = segment.allocations.size();

@@ -27,6 +27,9 @@ public:
     ConstantPool(BlockOfCode& code, size_t size);
 
     Xbyak::Address GetConstant(const Xbyak::AddressFrame& frame, u64 lower, u64 upper = 0);
+    // Separate slots in the near data pool. They are never deduplicated or
+    // referenced by literal constant users, and remain source-region owned.
+    void* AllocateMutableData(size_t bytes);
 
 private:
     static constexpr size_t align_size = 16;  // bytes

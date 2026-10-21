@@ -75,36 +75,271 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 A64EmitX64::~A64EmitX64() = default;
 
 void A64EmitX64::EmitSharedDispatch() {
+    EmitSharedLoopFlush();
+    EmitSharedPCFlush();
     // The destination is the executing thread's permanent prelude. No return
     // address in a reclaimable shared region is left on the native stack.
     code.jmp(code.qword[code.r15 + offsetof(A64JitState, shared_dispatch)]);
 }
 
+void A64EmitX64::EmitSharedPCValue(Xbyak::Reg64 target) {
+    if (shared_pc_in_r11)
+        code.mov(target, r11);
+    else
+        code.mov(target, qword[r15 + offsetof(A64JitState, pc)]);
+}
+
+void A64EmitX64::EmitSharedPCFlush() {
+    if (shared_pc_in_r11)
+        code.mov(qword[r15 + offsetof(A64JitState, pc)], r11);
+}
+
+void A64EmitX64::EmitSharedGeneration(Xbyak::Reg64 target) {
+    if (shared_generation) {
+        // The cache owns both this counter and every executable region. x64's
+        // accumulator moffs form loads it directly, without a dependent load
+        // of the same immutable pointer from every executing Jit's state.
+        code.mov(rax, qword[reinterpret_cast<u64>(shared_generation)]);
+        if (target.getIdx() != rax.getIdx())
+            code.mov(target, rax);
+    } else {
+        code.mov(target, qword[r15 + offsetof(A64JitState, shared_generation)]);
+        code.mov(target, qword[target]);
+    }
+}
+
+void A64EmitX64::PrepareSharedDispatch(IR::Block& block) {
+    shared_static_dispatch.reset();
+    shared_static_pc_inst = nullptr;
+    shared_dynamic_pc_inst = nullptr;
+    shared_pc_in_r11 = false;
+    shared_static_fpcr = shared_optimized;
+    const auto terminal = block.GetTerminal();
+    const bool constant_terminal = boost::get<IR::Term::FastDispatchHint>(&terminal) != nullptr;
+    if (!shared_optimized)
+        return;
+    if (!conf.very_verbose_debugging_output && !block.empty()
+        && block.back().GetOpcode() == IR::Opcode::A64SetPC
+        && (constant_terminal || boost::get<IR::Term::PopRSBHint>(&terminal))) {
+        shared_dynamic_pc_inst = &block.back();
+    }
+
+    // Constant propagation can resolve ADR/BR and constant function pointers.
+    // Keep that information through the terminal instead of rebuilding the
+    // descriptor and hashing it again at run time. Callbacks and FPCR writes
+    // require the general dispatcher because they can change the descriptor.
+    for (const auto& inst : block) {
+        const auto op = inst.GetOpcode();
+        if (inst.WritesToFPCR() || inst.IsMemoryRead() || inst.IsMemoryWrite()
+            || inst.CausesCPUException() || op == IR::Opcode::CallHostFunction
+            || op == IR::Opcode::A64DataCacheOperationRaised
+            || op == IR::Opcode::A64InstructionCacheOperationRaised
+            || op == IR::Opcode::A64GetCNTPCT
+            || (op == IR::Opcode::A64InstructionSynchronizationBarrier && conf.hook_isb)) {
+            shared_static_dispatch.reset();
+            shared_static_pc_inst = nullptr;
+            shared_static_fpcr = false;
+            return;
+        }
+        if (constant_terminal && op == IR::Opcode::A64SetPC) {
+            shared_static_dispatch.reset();
+            shared_static_pc_inst = nullptr;
+            if (inst.GetArg(0).IsImmediate()) {
+                shared_static_dispatch = A64::LocationDescriptor{block.Location()}
+                    .SetSingleStepping(false).SetPC(inst.GetArg(0).GetU64());
+                shared_static_pc_inst = &inst;
+            }
+        }
+    }
+}
+
+void A64EmitX64::EmitSharedLinkFallback(IR::LocationDescriptor target) {
+    code.mov(rax, A64::LocationDescriptor{target}.PC());
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    // A return-link cell can enter this veneer from a different block. Its
+    // caller has already materialized guest registers: do not emit a
+    // source-block-specific register flush here.
+    code.jmp(qword[r15 + offsetof(A64JitState, shared_dispatch)]);
+}
+
 void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
                                IR::LocationDescriptor initial_location, bool is_single_step) {
-    code.mov(rax, A64::LocationDescriptor{next}.PC());
-    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
-    if (next == initial_location && !is_single_step) {
-        // This edge stays inside this immutable block. It needs neither a
-        // dispatch-index lookup nor a patchable cross-region code pointer.
-        // Invalidation/retirement must still force a permanent-prelude
-        // safepoint even when a guest spends its whole Run in a tight loop.
-        Xbyak::Label dispatch;
+    const bool self_edge = next == initial_location;
+    std::atomic<const void*>* cell = nullptr;
+    if (!self_edge && !is_single_step && shared_link_resolver
+        && conf.HasOptimization(OptimizationFlag::BlockLinking)) {
+        cell = std::construct_at(static_cast<std::atomic<const void*>*>(
+            code.AllocateMutableData(sizeof(std::atomic<const void*>))), nullptr);
+    }
+
+    if (!is_single_step && (self_edge || cell)) {
+        // Mutable link data belongs to the source region. A published target
+        // replaces only this atomic cell, never executable instruction bytes.
+        // All edges still test the reclamation generation and halt state.
+        Xbyak::Label fallback;
         code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
-        code.jne(dispatch, code.T_NEAR);
+        code.jne(fallback, code.T_NEAR);
         if (conf.enable_cycle_counting) {
             code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
-            code.jle(dispatch, code.T_NEAR);
+            code.jle(fallback, code.T_NEAR);
         }
-        code.mov(rax, qword[r15 + offsetof(A64JitState, shared_generation)]);
-        code.mov(rax, qword[rax]);
+        EmitSharedGeneration(rax);
         code.cmp(rax, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
-        code.jne(dispatch, code.T_NEAR);
-        ASSERT(shared_block_entrypoint);
-        code.jmp(shared_block_entrypoint);
-        code.L(dispatch);
+        code.jne(fallback, code.T_NEAR);
+        if (self_edge) {
+            ASSERT(shared_block_entrypoint);
+            code.jmp(shared_block_entrypoint);
+        } else {
+            EmitSharedLoopFlush();
+            code.jmp(qword[rip + cell]);
+        }
+        code.L(fallback);
+        if (cell) {
+            const void* const fallback_entrypoint = code.getCurr();
+            cell->store(fallback_entrypoint, std::memory_order_relaxed);
+            shared_link_resolver(next.Value(), cell, fallback_entrypoint);
+        }
     }
+    code.mov(rax, A64::LocationDescriptor{next}.PC());
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
     EmitSharedDispatch();
+}
+
+void A64EmitX64::EmitSharedDispatchCacheIndex(Xbyak::Reg64 index,
+                                            Xbyak::Reg64 location, Xbyak::Reg64 scratch) {
+    if (code.HasHostFeature(HostFeature::SSE42)) {
+        code.xor_(index.cvt32(), index.cvt32());
+        code.crc32(index, location);
+    } else {
+        code.mov(index, location);
+        code.shr(index, 2);
+        code.mov(scratch, location);
+        code.shr(scratch, 12);
+        code.xor_(index, scratch);
+        code.shl(index, 5);
+    }
+    code.and_(index.cvt32(), u32(A64JitState::SharedDispatchCacheByteMask));
+    code.lea(index, ptr[r15 + offsetof(A64JitState, shared_dispatch_cache) + index]);
+}
+
+void A64EmitX64::EmitSharedDispatchCacheFill(Xbyak::Reg64 entrypoint,
+                                           Xbyak::Reg64 location) {
+    EmitSharedDispatchCacheIndex(r9, location, r10);
+    code.mov(r10, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
+    code.mov(qword[r9 + offsetof(A64JitState::SharedDispatchCacheEntry, location)], location);
+    code.mov(qword[r9 + offsetof(A64JitState::SharedDispatchCacheEntry, entrypoint)], entrypoint);
+    code.mov(qword[r9 + offsetof(A64JitState::SharedDispatchCacheEntry, generation)], r10);
+}
+
+void A64EmitX64::EmitSharedIndirect(IR::LocationDescriptor initial_location, bool is_single_step) {
+    EmitSharedLoopFlush();
+    if (is_single_step || !conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        EmitSharedDispatch();
+        return;
+    }
+    // Each branch site chooses two fixed private slots at compile time. The
+    // slots are only hints: descriptor and generation remain the authority.
+    // It shares the bounded private table with the general dispatcher, so a
+    // collision needs neither allocation nor shared executable-code patching.
+    const u64 source = initial_location.Value();
+    const auto slot = (((source >> 2) ^ (source >> 12) ^ (source >> 32))
+        & (A64JitState::SharedDispatchCacheSize / 2 - 1)) * 2;
+    const auto offset = offsetof(A64JitState, shared_dispatch_cache)
+        + slot * sizeof(A64JitState::SharedDispatchCacheEntry);
+    Xbyak::Label dispatch;
+    code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+    code.jne(dispatch, code.T_NEAR);
+    if (conf.enable_cycle_counting) {
+        code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+        code.jle(dispatch, code.T_NEAR);
+    }
+    EmitSharedGeneration(rdx);
+    code.cmp(rdx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
+    code.jne(dispatch, code.T_NEAR);
+    EmitSharedPCValue(rax);
+    code.mov(rcx, A64::LocationDescriptor::pc_mask);
+    code.and_(rax, rcx);
+    if (shared_static_fpcr) {
+        const u64 fpcr = initial_location.Value() &
+            (u64(A64::LocationDescriptor::fpcr_mask) << A64::LocationDescriptor::fpcr_shift);
+        if (fpcr != 0) {
+            code.mov(rcx, fpcr);
+            code.or_(rax, rcx);
+        }
+    } else {
+        code.mov(ecx, dword[r15 + offsetof(A64JitState, fpcr)]);
+        code.and_(ecx, A64::LocationDescriptor::fpcr_mask);
+        code.shl(rcx, A64::LocationDescriptor::fpcr_shift);
+        code.or_(rax, rcx);
+    }
+    for (unsigned way = 0; way < 2; ++way) {
+        Xbyak::Label next;
+        const auto entry_offset = offset + way * sizeof(A64JitState::SharedDispatchCacheEntry);
+        code.cmp(qword[r15 + entry_offset + offsetof(A64JitState::SharedDispatchCacheEntry, generation)], rdx);
+        code.jne(next, code.T_SHORT);
+        code.cmp(qword[r15 + entry_offset + offsetof(A64JitState::SharedDispatchCacheEntry, location)], rax);
+        code.jne(next, code.T_SHORT);
+        code.jmp(qword[r15 + entry_offset + offsetof(A64JitState::SharedDispatchCacheEntry, entrypoint)]);
+        code.L(next);
+    }
+    // RBX is preserved by the C++ lookup callback. The tail jump is essential:
+    // the owner prelude may refresh the reader epoch and reclaim this source.
+    EmitSharedPCFlush();
+    code.mov(ecx, dword[r15 + offset + offsetof(A64JitState::SharedDispatchCacheEntry, replacement)]);
+    code.xor_(dword[r15 + offset + offsetof(A64JitState::SharedDispatchCacheEntry, replacement)],
+              u32(sizeof(A64JitState::SharedDispatchCacheEntry)));
+    code.lea(rbx, ptr[r15 + offset + rcx]);
+    code.jmp(qword[r15 + offsetof(A64JitState, shared_indirect_lookup)]);
+    code.L(dispatch);
+    EmitSharedDispatch();
+}
+
+void A64EmitX64::EmitSharedReturn(IR::LocationDescriptor initial_location, bool is_single_step) {
+    EmitSharedLoopFlush();
+    Xbyak::Label fallback;
+    if (!is_single_step && shared_link_resolver
+        && conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+        code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(fallback, code.T_NEAR);
+        if (conf.enable_cycle_counting) {
+            code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+            code.jle(fallback, code.T_NEAR);
+        }
+        EmitSharedGeneration(rcx);
+        code.cmp(rcx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
+        code.jne(fallback, code.T_NEAR);
+
+        code.mov(eax, dword[r15 + offsetof(A64JitState, shared_rsb_ptr)]);
+        code.sub(eax, 1);
+        code.and_(eax, u32(A64JitState::RSBPtrMask));
+        code.mov(dword[r15 + offsetof(A64JitState, shared_rsb_ptr)], eax);
+        // Check before loading the cell address: its source region may have
+        // retired while a callee passed through a reclamation safepoint.
+        code.cmp(qword[r15 + offsetof(A64JitState, shared_rsb_generations) + rax * 8], rcx);
+        code.jne(fallback, code.T_NEAR);
+        EmitSharedPCValue(rbx);
+        code.mov(rcx, A64::LocationDescriptor::pc_mask);
+        code.and_(rbx, rcx);
+        if (shared_static_fpcr) {
+            const u64 fpcr = initial_location.Value() &
+                (u64(A64::LocationDescriptor::fpcr_mask) << A64::LocationDescriptor::fpcr_shift);
+            if (fpcr != 0) {
+                code.mov(rcx, fpcr);
+                code.or_(rbx, rcx);
+            }
+        } else {
+            code.mov(ecx, dword[r15 + offsetof(A64JitState, fpcr)]);
+            code.and_(ecx, A64::LocationDescriptor::fpcr_mask);
+            code.shl(rcx, A64::LocationDescriptor::fpcr_shift);
+            code.or_(rbx, rcx);
+        }
+        code.cmp(qword[r15 + offsetof(A64JitState, shared_rsb_locations) + rax * 8], rbx);
+        code.jne(fallback, code.T_NEAR);
+        code.mov(rax, qword[r15 + offsetof(A64JitState, shared_rsb_cells) + rax * 8]);
+        code.jmp(qword[rax]);
+        code.L(fallback);
+    }
+    EmitSharedIndirect(initial_location, is_single_step);
 }
 
 void A64EmitX64::RegisterFastmemPatch(u64 rip, FastmemPatchInfo info) {
@@ -135,6 +370,7 @@ FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
 }
 
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
+#include "dynarmic/backend/x64/a64_shared_loop.inc"
 
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (conf.very_verbose_debugging_output) {
@@ -147,6 +383,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
             code.DisableWriting();
     };
 
+    PrepareSharedDispatch(block);
     std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
         if (conf.page_table) {
@@ -158,6 +395,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         return gprs;
     }();
 
+    PrepareSharedLoop(block, gpr_order);
     RegAlloc reg_alloc{code, std::move(gpr_order), any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
 
@@ -165,7 +403,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     code.align();
     const u8* const entrypoint = code.getCurr();
     if (shared_optimized)
-        shared_block_entrypoint = entrypoint;
+        EmitSharedLoopEntry();
 
     ASSERT(block.GetCondition() == IR::Cond::AL);
 
@@ -310,12 +548,16 @@ void A64EmitX64::GenTerminalHandlers() {
         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
         code.LookupBlock();
-        Xbyak::Label skip_private_fill;
+        Xbyak::Label shared_fill, dispatch;
         code.cmp(byte[r15 + offsetof(A64JitState, last_lookup_is_shared)], 0);
-        code.jne(skip_private_fill, code.T_SHORT);
+        code.jne(shared_fill, code.T_NEAR);
         code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
         code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
-        code.L(skip_private_fill);
+        code.jmp(dispatch, code.T_NEAR);
+        code.L(shared_fill);
+        if (conf.shared_code_cache && conf.enable_baseline_hot_optimization)
+            EmitSharedDispatchCacheFill(rax, rbx);
+        code.L(dispatch);
         code.jmp(rax);
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
 
@@ -335,7 +577,36 @@ void A64EmitX64::GenTerminalHandlers() {
 
 
 void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
-    if (shared_optimized || !conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+    if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+        return;
+    }
+
+    if (shared_optimized) {
+        if (!shared_link_resolver)
+            return;
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        ASSERT(args[0].IsImmediate());
+        const auto target = IR::LocationDescriptor{args[0].GetImmediateU64()};
+        auto* const cell = std::construct_at(static_cast<std::atomic<const void*>*>(
+            code.AllocateMutableData(sizeof(std::atomic<const void*>))), nullptr);
+        const Xbyak::Reg64 index = ctx.reg_alloc.ScratchGpr();
+        const Xbyak::Reg64 value = ctx.reg_alloc.ScratchGpr();
+        code.mov(index.cvt32(), dword[r15 + offsetof(A64JitState, shared_rsb_ptr)]);
+        code.mov(value, target.Value());
+        code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_locations) + index * 8], value);
+        code.mov(value, reinterpret_cast<u64>(cell));
+        code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_cells) + index * 8], value);
+        code.mov(value, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
+        code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_generations) + index * 8], value);
+        code.add(index.cvt32(), 1);
+        code.and_(index.cvt32(), u32(A64JitState::RSBPtrMask));
+        code.mov(dword[r15 + offsetof(A64JitState, shared_rsb_ptr)], index.cvt32());
+        ctx.deferred_emits.emplace_back([this, cell, target] {
+            const void* const fallback = code.getCurr();
+            EmitSharedLinkFallback(target);
+            cell->store(fallback, std::memory_order_relaxed);
+            shared_link_resolver(target.Value(), cell, fallback);
+        });
         return;
     }
 
@@ -394,14 +665,20 @@ void A64EmitX64::EmitA64SetNZCVRaw(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(args[0]).cvt32();
-    code.mov(dword[r15 + offsetof(A64JitState, cpsr_nzcv)], to_store);
+    if (shared_loop_flags)
+        code.mov(r10d, to_store);
+    else
+        code.mov(dword[r15 + offsetof(A64JitState, cpsr_nzcv)], to_store);
 }
 
 void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr().cvt32();
 
-    code.mov(result, dword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    if (const auto host = shared_loop_registers[A64::RegNumber(reg)])
+        code.mov(result, HostLocToReg64(*host).cvt32());
+    else
+        code.mov(result, dword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
@@ -409,7 +686,10 @@ void A64EmitX64::EmitA64GetX(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
 
-    code.mov(result, qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    if (const auto host = shared_loop_registers[A64::RegNumber(reg)])
+        code.mov(result, HostLocToReg64(*host));
+    else
+        code.mov(result, qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
@@ -466,6 +746,14 @@ void A64EmitX64::EmitA64GetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    if (const auto host = shared_loop_registers[A64::RegNumber(reg)]) {
+        const auto destination = HostLocToReg64(*host).cvt32();
+        if (args[1].IsImmediate())
+            code.mov(destination, args[1].GetImmediateU32());
+        else
+            code.mov(destination, ctx.reg_alloc.UseGpr(args[1]).cvt32());
+        return;
+    }
     const auto addr = qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
@@ -480,6 +768,16 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    if (const auto host = shared_loop_registers[A64::RegNumber(reg)]) {
+        const auto destination = HostLocToReg64(*host);
+        if (args[1].IsImmediate())
+            code.mov(destination, args[1].GetImmediateU64());
+        else if (args[1].IsInXmm())
+            code.movq(destination, ctx.reg_alloc.UseXmm(args[1]));
+        else
+            code.mov(destination, ctx.reg_alloc.UseGpr(args[1]));
+        return;
+    }
     const auto addr = qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
@@ -563,7 +861,17 @@ void A64EmitX64::EmitA64SetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64SetPC(A64EmitContext& ctx, IR::Inst* inst) {
+    if (inst == shared_static_pc_inst)
+        return;  // The constant-edge fallback materializes this PC if needed.
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (inst == shared_dynamic_pc_inst) {
+        // This is the last IR instruction of a plain indirect/return block.
+        // Keep the target through the terminal to avoid a store-forwarding
+        // dependency on every hit; slow exits materialize the guest PC.
+        ctx.reg_alloc.Use(args[0], HostLoc::R11);
+        shared_pc_in_r11 = true;
+        return;
+    }
     const auto addr = qword[r15 + offsetof(A64JitState, pc)];
     if (args[0].FitsInImmediateS32()) {
         code.mov(addr, args[0].GetImmediateS32());
@@ -796,9 +1104,9 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
     }
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor initial_location, bool is_single_step) {
     if (shared_optimized) {
-        EmitSharedDispatch();
+        EmitSharedReturn(initial_location, is_single_step);
         return;
     }
     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
@@ -809,9 +1117,12 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, 
     code.jmp(terminal_handler_pop_rsb_hint);
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor initial_location, bool is_single_step) {
     if (shared_optimized) {
-        EmitSharedDispatch();
+        if (shared_static_dispatch)
+            EmitSharedLink(*shared_static_dispatch, initial_location, is_single_step);
+        else
+            EmitSharedIndirect(initial_location, is_single_step);
         return;
     }
     if (!conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
@@ -829,7 +1140,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor 
         EmitTerminal(terminal.then_, initial_location, is_single_step);
         break;
     default:
-        Xbyak::Label pass = EmitCond(terminal.if_);
+        Xbyak::Label pass = EmitCond(terminal.if_, shared_loop_flags);
         EmitTerminal(terminal.else_, initial_location, is_single_step);
         code.L(pass);
         EmitTerminal(terminal.then_, initial_location, is_single_step);

@@ -950,8 +950,10 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
     const Xbyak::Reg8 carry = DoCarry(ctx.reg_alloc, carry_in, carry_inst);
     const Xbyak::Reg8 overflow = overflow_inst ? ctx.reg_alloc.ScratchGpr().cvt8() : Xbyak::Reg8{-1};
 
-    if (args[1].IsImmediate() && args[1].GetType() == IR::Type::U32) {
-        const u32 op_arg = args[1].GetImmediateU32();
+    // x64 arithmetic accepts a sign-extended imm32 even for a 64-bit
+    // operation. Small A64 constants should not consume a host register.
+    if (args[1].IsImmediate() && (bitsize == 32 || args[1].FitsInImmediateS32())) {
+        const u32 op_arg = static_cast<u32>(args[1].GetImmediateU64());
         if (carry_in.IsImmediate()) {
             if (carry_in.GetImmediateU1()) {
                 code.stc();
@@ -1034,16 +1036,16 @@ static void EmitSub(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
     bool invert_output_carry = true;
 
     if (is_cmp) {
-        if (args[1].IsImmediate() && args[1].GetType() == IR::Type::U32) {
-            const u32 op_arg = args[1].GetImmediateU32();
+        if (args[1].IsImmediate() && (bitsize == 32 || args[1].FitsInImmediateS32())) {
+            const u32 op_arg = static_cast<u32>(args[1].GetImmediateU64());
             code.cmp(result, op_arg);
         } else {
             OpArg op_arg = ctx.reg_alloc.UseOpArg(args[1]);
             op_arg.setBit(bitsize);
             code.cmp(result, *op_arg);
         }
-    } else if (args[1].IsImmediate() && args[1].GetType() == IR::Type::U32) {
-        const u32 op_arg = args[1].GetImmediateU32();
+    } else if (args[1].IsImmediate() && (bitsize == 32 || args[1].FitsInImmediateS32())) {
+        const u32 op_arg = static_cast<u32>(args[1].GetImmediateU64());
         if (carry_in.IsImmediate()) {
             if (carry_in.GetImmediateU1()) {
                 code.sub(result, op_arg);

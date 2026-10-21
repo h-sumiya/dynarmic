@@ -10,8 +10,8 @@
 namespace Dynarmic::A64 {
 
 struct SharedCodeCacheConfig {
-    // Includes every live AND retired executable region. A stalled reader
-    // delays compilation rather than allowing this bound to grow.
+    // Includes constructing, live and retired executable regions. A stalled
+    // reader delays compilation rather than allowing this bound to grow.
     std::size_t capacity_bytes = 256u * 1024u * 1024u;
     std::size_t region_size = 8u * 1024u * 1024u;
     std::size_t max_pending_jobs = 1024;
@@ -25,9 +25,16 @@ struct SharedCodeCacheStatistics {
     std::uint64_t compiled_blocks = 0, failed_jobs = 0, discarded_jobs = 0;
     std::uint64_t compilation_nanoseconds = 0;
     std::uint64_t live_blocks = 0, pending_jobs = 0;
+    // Charged capacity includes construction reservations and remains charged
+    // until worker-side physical destruction has finished.
     std::uint64_t allocated_bytes = 0, retired_bytes = 0;
     std::uint64_t reclaimed_bytes = 0, reclaimed_regions = 0;
     std::uint64_t capacity_bytes = 0;
+    std::uint64_t queue_wait_nanoseconds = 0, queue_wait_max_nanoseconds = 0;
+    std::uint64_t pending_high_water = 0;
+    std::uint64_t link_cells = 0;
+    std::uint64_t retirement_nanoseconds = 0, retirement_max_nanoseconds = 0;
+    std::uint64_t reclamation_nanoseconds = 0, reclamation_max_nanoseconds = 0;
 };
 
 struct SharedCodeCacheAccess;

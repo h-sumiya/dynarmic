@@ -276,12 +276,17 @@ void EmitX64::EmitAddCycles(size_t cycles) {
     code.sub(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], static_cast<u32>(cycles));
 }
 
-Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
+Xbyak::Label EmitX64::EmitCond(IR::Cond cond, bool flags_are_live) {
     Xbyak::Label pass;
 
-    code.mov(eax, dword[r15 + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
-
-    code.LoadRequiredFlagsForCondFromRax(cond);
+    if (!flags_are_live) {
+        code.mov(eax, dword[r15 + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+        code.LoadRequiredFlagsForCondFromRax(cond);
+    } else if (cond == IR::Cond::HI || cond == IR::Cond::LS) {
+        // x64 unsigned comparisons use a borrow flag, whereas the saved
+        // NZCV and live arithmetic flags use ARM's no-borrow convention.
+        code.cmc();
+    }
 
     switch (cond) {
     case IR::Cond::EQ:

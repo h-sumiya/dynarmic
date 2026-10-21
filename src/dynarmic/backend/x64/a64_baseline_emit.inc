@@ -12,13 +12,13 @@ void A64EmitX64::GenBaselineReturn() {
         code.jle(code.GetForceReturnFromRunCodeAddress());
     }
     if (!shared_optimized && conf.shared_code_cache && conf.enable_baseline_hot_optimization) {
-        Xbyak::Label local, refresh;
+        Xbyak::Label local, refresh, shared_index;
         // A generation change is handled only here, after tail-leaving the
         // shared body. Refreshing an epoch from a callback would be unsafe:
         // its native return address may still name the shared region.
         code.mov(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_generation)]);
-        code.mov(code.rdx, code.qword[code.rax]);
-        code.cmp(code.rdx, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
+        code.mov(code.r8, code.qword[code.rax]);
+        code.cmp(code.r8, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
         code.jne(refresh, code.T_NEAR);
 
         code.mov(code.rbx, code.qword[code.r15 + offsetof(A64JitState, pc)]);
@@ -28,6 +28,16 @@ void A64EmitX64::GenBaselineReturn() {
         code.and_(code.edx, A64::LocationDescriptor::fpcr_mask);
         code.shl(code.rdx, A64::LocationDescriptor::fpcr_shift);
         code.or_(code.rbx, code.rdx);
+        // Repeated dynamic branches normally hit private data in L1. The
+        // owner writes only on a miss; shared dispatch data stays read-only.
+        // A generation mismatch rejects the raw pointer before it is loaded.
+        EmitSharedDispatchCacheIndex(code.r9, code.rbx, code.rax);
+        code.cmp(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, generation)], code.r8);
+        code.jne(shared_index, code.T_NEAR);
+        code.cmp(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, location)], code.rbx);
+        code.jne(shared_index, code.T_NEAR);
+        code.jmp(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, entrypoint)]);
+        code.L(shared_index);
         // Same hash as SharedCodeHash, with no locks, refcounts or writes.
         code.mov(code.rax, code.rbx);
         code.shr(code.rax, 2);
@@ -48,7 +58,11 @@ void A64EmitX64::GenBaselineReturn() {
             code.jz(next, code.T_SHORT);
             code.cmp(code.qword[code.rax], code.rbx);
             code.jne(next, code.T_SHORT);
-            code.jmp(code.qword[code.rax + 8]);
+            code.mov(code.r10, code.qword[code.rax + 8]);
+            code.mov(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, location)], code.rbx);
+            code.mov(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, entrypoint)], code.r10);
+            code.mov(code.qword[code.r9 + offsetof(A64JitState::SharedDispatchCacheEntry, generation)], code.r8);
+            code.jmp(code.r10);
             code.L(next);
         }
         code.jmp(local, code.T_NEAR);
@@ -65,6 +79,88 @@ void A64EmitX64::GenBaselineReturn() {
     code.cmp(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], 0);
     code.jne(code.GetForceReturnFromRunCodeAddress());
     code.LookupBlock();
+    code.jmp(code.rax);
+
+    code.align();
+    shared_indirect_lookup = code.getCurr<const void*>();
+    // Entry comes only from a shared body's tail jump, with RBX naming one
+    // private cache slot. A C++ miss is therefore a permanent-prelude
+    // safepoint: no native return address retains the previous source region.
+    code.cmp(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], 0);
+    code.jne(code.GetForceReturnFromRunCodeAddress());
+    if (conf.enable_cycle_counting) {
+        code.cmp(code.qword[code.rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+        code.jle(code.GetForceReturnFromRunCodeAddress());
+    }
+    // RBX retains the source site's private cache slot; RBP retains the
+    // descriptor across any C++ lookup. Both are ABI callee-saved registers.
+    code.mov(code.rbp, code.qword[code.r15 + offsetof(A64JitState, pc)]);
+    code.mov(code.rcx, A64::LocationDescriptor::pc_mask);
+    code.and_(code.rbp, code.rcx);
+    code.mov(code.ecx, code.dword[code.r15 + offsetof(A64JitState, fpcr)]);
+    code.and_(code.ecx, A64::LocationDescriptor::fpcr_mask);
+    code.shl(code.rcx, A64::LocationDescriptor::fpcr_shift);
+    code.or_(code.rbp, code.rcx);
+    Xbyak::Label lookup, fill_shared;
+    code.mov(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_generation)]);
+    code.mov(code.rax, code.qword[code.rax]);
+    code.cmp(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
+    code.jne(lookup, code.T_NEAR);
+    code.mov(code.rax, code.rbp);
+    code.shr(code.rax, 2);
+    code.mov(code.rcx, code.rbp);
+    code.shr(code.rcx, 19);
+    code.xor_(code.rax, code.rcx);
+    code.mov(code.rcx, code.rbp);
+    code.shr(code.rcx, 37);
+    code.xor_(code.rax, code.rcx);
+    code.and_(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_dispatch_mask)]);
+    code.shl(code.rax, 5);
+    code.mov(code.rdx, code.qword[code.r15 + offsetof(A64JitState, shared_dispatch_table)]);
+    code.add(code.rdx, code.rax);
+    for (int way = 0; way < 4; ++way) {
+        Xbyak::Label next;
+        code.mov(code.rax, code.qword[code.rdx + way * 8]);
+        code.test(code.rax, code.rax);
+        code.jz(next, code.T_SHORT);
+        code.cmp(code.qword[code.rax], code.rbp);
+        code.jne(next, code.T_SHORT);
+        code.mov(code.rax, code.qword[code.rax + 8]);
+        code.jmp(fill_shared, code.T_NEAR);
+        code.L(next);
+    }
+    const auto baseline_slot = [&] {
+        code.mov(code.r12, reinterpret_cast<u64>(fast_dispatch_table.get()));
+        code.mov(code.rdx, code.rbp);
+        if (code.HasHostFeature(HostFeature::SSE42))
+            code.crc32(code.rdx, code.r12);
+        code.and_(code.edx, fast_dispatch_table_mask);
+        code.add(code.rdx, code.r12);
+    };
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        // A cold or unsupported target continues directly in its private
+        // baseline block. Never make a frequently used baseline target pay a
+        // C++ lookup merely because its caller has already been optimized.
+        baseline_slot();
+        code.cmp(code.qword[code.rdx + offsetof(FastDispatchEntry, location_descriptor)], code.rbp);
+        code.jne(lookup, code.T_NEAR);
+        code.jmp(code.qword[code.rdx + offsetof(FastDispatchEntry, code_ptr)]);
+    }
+    code.L(lookup);
+    code.LookupBlock();
+    code.cmp(code.byte[code.r15 + offsetof(A64JitState, last_lookup_is_shared)], 0);
+    code.jne(fill_shared, code.T_NEAR);
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        baseline_slot();
+        code.mov(code.qword[code.rdx + offsetof(FastDispatchEntry, location_descriptor)], code.rbp);
+        code.mov(code.qword[code.rdx + offsetof(FastDispatchEntry, code_ptr)], code.rax);
+    }
+    code.jmp(code.rax);
+    code.L(fill_shared);
+    code.mov(code.rdx, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
+    code.mov(code.qword[code.rbx + offsetof(A64JitState::SharedDispatchCacheEntry, location)], code.rbp);
+    code.mov(code.qword[code.rbx + offsetof(A64JitState::SharedDispatchCacheEntry, entrypoint)], code.rax);
+    code.mov(code.qword[code.rbx + offsetof(A64JitState::SharedDispatchCacheEntry, generation)], code.rdx);
     code.jmp(code.rax);
 }
 

@@ -429,25 +429,36 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
 
 #include "dynarmic/backend/x64/emit_exclusive_alignment_a64.inc"
 
-void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {
+void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end) {
     if (!conf.check_halt_on_memory_access) {
         return;
     }
 
-    Xbyak::Label skip;
-
     const A64::LocationDescriptor current_location{IR::LocationDescriptor{inst->GetArg(0).GetU64()}};
 
     code.test(dword[r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::MemoryAbort));
-    if (end) {
-        code.jz(*end, code.T_NEAR);
-    } else {
-        code.jz(skip, code.T_NEAR);
+    if (!end) {
+        // Callbacks normally return without an architectural memory abort.
+        // Keep that path contiguous instead of taking a branch over the cold
+        // PC materialization after every access. The shared label and captured
+        // location survive until this block's deferred tail is emitted/sealed.
+        const auto abort = GenSharedLabel();
+        code.jnz(*abort, code.T_NEAR);
+        ctx.deferred_emits.emplace_back([this, abort, current_location] {
+            code.L(*abort);
+            code.mov(rax, current_location.PC());
+            code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+            code.ForceReturnFromRunCode();
+        });
+        return;
     }
+    // Fastmem/page-table recovery already runs in a deferred veneer. Keep its
+    // successful return edge and emit its abort exit here, without appending
+    // another deferred operation while the emitter iterates that collection.
+    code.jz(*end, code.T_NEAR);
     code.mov(rax, current_location.PC());
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
     code.ForceReturnFromRunCode();
-    code.L(skip);
 }
 
 }  // namespace Dynarmic::Backend::X64

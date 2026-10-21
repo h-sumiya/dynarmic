@@ -9,16 +9,18 @@
 #include <condition_variable>
 #include <deque>
 #include <list>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/backend/page_range_index.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/a64_runtime_callback.h"
 #include "dynarmic/backend/x64/block_of_code.h"
@@ -83,6 +85,14 @@ UserConfig WorkerConfig(UserConfig conf) {
     return conf;
 }
 
+struct IncomingLink {
+    std::atomic<const void*>* cell;
+    const void* fallback;
+    IncomingLink* previous;
+    IncomingLink* next;
+    std::uint64_t target;
+};
+
 struct SharedRegion {
     explicit SharedRegion(const UserConfig& conf, std::size_t bytes)
         : code(SharedRunCallbacks(conf), JitStateInfo{layout}, bytes, [](BlockOfCode&) {}, true),
@@ -92,6 +102,11 @@ struct SharedRegion {
     BlockOfCode code;
     A64EmitX64 emitter;
     std::vector<std::unique_ptr<SharedPublishedBlock>> records;
+    // The cells reside in this region's writable data pages. Deque element
+    // addresses remain stable while appending. Intrusive per-target chains
+    // let retirement unlink exactly this source's edges without scanning or
+    // copying every other region that calls the same popular helper.
+    std::deque<IncomingLink> links;
     bool sealed = false;
     bool building = false;
     bool retired = false;
@@ -99,18 +114,17 @@ struct SharedRegion {
     std::uint64_t retire_epoch = 0;
 };
 
-bool Overlaps(std::uint64_t first, std::uint64_t last, std::uint64_t address, std::size_t length) {
-    if (length == 0)
-        return false;
-    const auto end = address + static_cast<std::uint64_t>(length - 1);
-    if (end >= address)
-        return first <= end && address <= last;
-    return first <= end || address <= last;
-}
-
 } // namespace
 
 struct SharedCodeCache::Impl {
+    struct QueuedJob {
+        SharedCodeSnapshot snapshot;
+        std::chrono::steady_clock::time_point enqueued;
+    };
+    struct Reclamation {
+        std::unique_ptr<SharedRegion> region;
+        std::chrono::steady_clock::time_point started;
+    };
     explicit Impl(SharedCodeCacheConfig config_) : config(config_) {
         constexpr std::size_t mib = 1024 * 1024;
         if (config.region_size < 8 * mib || config.region_size > 512 * mib ||
@@ -158,6 +172,14 @@ struct SharedCodeCache::Impl {
         return (static_cast<std::size_t>(SharedCodeHash(location)) & (config.max_blocks / 4 - 1)) * 4;
     }
 
+    static std::uint64_t RangeKey(const SharedGuestRange& range) {
+        return reinterpret_cast<std::uintptr_t>(&range);
+    }
+
+    static const SharedPublishedBlock* RangeOwner(std::uint64_t key) {
+        return reinterpret_cast<const SharedGuestRange*>(static_cast<std::uintptr_t>(key))->owner;
+    }
+
     void PublishIndex(const SharedPublishedBlock* record) {
         const auto first = Slot(record->location);
         for (std::size_t i = 0; i < 4; ++i) {
@@ -171,7 +193,84 @@ struct SharedCodeCache::Impl {
         index[first + (victim++ & 3)].store(record, std::memory_order_release);
     }
 
+    void UpdateIncoming(std::uint64_t location, const void* entrypoint) {
+        const auto found = incoming.find(location);
+        if (found == incoming.end())
+            return;
+        for (auto* link = found->second; link; link = link->next)
+            link->cell->store(entrypoint ? entrypoint : link->fallback, std::memory_order_release);
+    }
+
+    void RegisterIncoming(SharedRegion& source, std::uint64_t location,
+                          std::atomic<const void*>* cell, const void* fallback) {
+        std::lock_guard lock(mutex);
+        auto [found, inserted] = incoming.try_emplace(location, nullptr);
+        try {
+            source.links.push_back({cell, fallback, nullptr, found->second, location});
+        } catch (...) {
+            if (inserted)
+                incoming.erase(found);
+            throw;
+        }
+        // No allocation remains after exposing the new node to the target's
+        // chain. A failed append leaves every prior head/link unchanged.
+        auto* link = &source.links.back();
+        if (found->second)
+            found->second->previous = link;
+        found->second = link;
+        ++statistics.link_cells;
+        const auto completed_target = completed.find(location);
+        cell->store(completed_target == completed.end() ? fallback : completed_target->second->entrypoint,
+                    std::memory_order_release);
+    }
+
+    void RemoveIncomingSource(SharedRegion& source) {
+        for (auto& link : source.links) {
+            if (link.previous) {
+                link.previous->next = link.next;
+            } else {
+                const auto found = incoming.find(link.target);
+                ASSERT(found != incoming.end() && found->second == &link);
+                if (link.next)
+                    found->second = link.next;
+                else
+                    incoming.erase(found);
+            }
+            if (link.next)
+                link.next->previous = link.previous;
+        }
+        statistics.link_cells -= source.links.size();
+    }
+
     void RemovePublished(SharedRegion& region) {
+        // Clear already removed all published slots and link targets. Do not
+        // scan historical per-region records again while retiring its slabs.
+        if (completed.empty())
+            return;
+        try {
+            std::vector<std::uint64_t> removed;
+            removed.reserve(region.records.size());
+            for (const auto& record : region.records) {
+                const auto found = completed.find(record->location);
+                if (found != completed.end() && found->second == record.get()) {
+                    for (const auto& range : record->guest_ranges)
+                        removed.push_back(RangeKey(range));
+                }
+            }
+            published_ranges.RemoveMany(removed);
+        } catch (const std::bad_alloc&) {
+            // RemoveMany completes all allocations before changing records.
+            // Retirement must still make progress under allocation pressure,
+            // including after an invalidation marks a worker's active region.
+            // The slower one-range path requires no allocation.
+            for (const auto& record : region.records) {
+                const auto found = completed.find(record->location);
+                if (found != completed.end() && found->second == record.get()) {
+                    for (const auto& range : record->guest_ranges)
+                        published_ranges.Remove(RangeKey(range));
+                }
+            }
+        }
         for (const auto& record : region.records) {
             const auto first = Slot(record->location);
             for (std::size_t i = 0; i < 4; ++i) {
@@ -180,14 +279,17 @@ struct SharedCodeCache::Impl {
                     slot.store(nullptr, std::memory_order_release);
             }
             const auto found = completed.find(record->location);
-            if (found != completed.end() && found->second == record.get())
+            if (found != completed.end() && found->second == record.get()) {
+                UpdateIncoming(record->location, nullptr);
                 completed.erase(found);
+            }
         }
         statistics.live_blocks = completed.size();
     }
 
     void Retire(SharedRegion& region) {
         ASSERT(region.sealed && !region.building && !region.retired);
+        const auto started = std::chrono::steady_clock::now();
         for (auto*& ptr : active)
             if (ptr == &region) ptr = nullptr;
         RemovePublished(region);
@@ -196,9 +298,17 @@ struct SharedCodeCache::Impl {
         region.retire_epoch = generation.fetch_add(1, std::memory_order_seq_cst) + 1;
         region.retired = true;
         statistics.retired_bytes += config.region_size;
+        ++retired_regions;
+        const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        statistics.retirement_nanoseconds += elapsed;
+        statistics.retirement_max_nanoseconds = std::max(statistics.retirement_max_nanoseconds, elapsed);
+        changed.notify_all();
     }
 
-    void Collect() {
+    Reclamation TakeRetiredRegion() {
+        if (retired_regions == 0)
+            return {};
         for (auto it = regions.begin(); it != regions.end();) {
             auto& region = **it;
             if (!region.retired) { ++it; continue; }
@@ -207,15 +317,38 @@ struct SharedCodeCache::Impl {
                 return epoch != 0 && epoch < region.retire_epoch;
             });
             if (protected_reader) { ++it; continue; }
+            const auto started = std::chrono::steady_clock::now();
+            RemoveIncomingSource(region);
+            auto result = std::move(*it);
+            regions.erase(it);
+            // Still charge this physical allocation until the worker has
+            // destroyed it. Another worker must not overcommit the budget.
+            return {std::move(result), started};
+        }
+        return {};
+    }
+
+    void ReclaimRegion(Reclamation reclamation) {
+        // Destruction includes metadata deletion, fault-registry removal and
+        // unmapping executable pages. Only an optimizer worker does this, and
+        // never while holding the scheduler mutex or an execution-thread Jit.
+        reclamation.region.reset();
+        const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - reclamation.started).count());
+        {
+            std::lock_guard lock(mutex);
             statistics.allocated_bytes -= config.region_size;
             statistics.retired_bytes -= config.region_size;
             statistics.reclaimed_bytes += config.region_size;
             ++statistics.reclaimed_regions;
-            it = regions.erase(it);
+            --retired_regions;
+            statistics.reclamation_nanoseconds += elapsed;
+            statistics.reclamation_max_nanoseconds = std::max(statistics.reclamation_max_nanoseconds, elapsed);
         }
+        changed.notify_all();
     }
 
-    SharedRegion* RegionFor(std::size_t worker) {
+    SharedRegion* RegionFor(std::size_t worker, std::unique_lock<std::mutex>& lock) {
         constexpr std::size_t emission_reserve = 1024 * 1024;
         auto*& current = active[worker];
         if (current && (current->sealed || current->code.SpaceRemaining() < emission_reserve)) {
@@ -224,24 +357,64 @@ struct SharedCodeCache::Impl {
         }
         if (current)
             return current;
-        Collect();
         if (statistics.allocated_bytes + config.region_size > config.capacity_bytes) {
-            // FIFO region retirement is bounded work. All native links leave
-            // through the permanent per-thread dispatcher, so no other region
-            // embeds a pointer into this victim.
+            // Retiring more regions cannot make progress while an earlier
+            // victim awaits a reader or a worker's physical destruction. Keep
+            // the remaining useful publications alive instead of cascading
+            // through the whole cache during that grace period.
+            if (retired_regions != 0)
+                return nullptr;
+            // FIFO region retirement clears incoming mutable link cells and
+            // removes publication before advancing the reader epoch. Existing
+            // readers retain the victim until their next dispatch safepoint.
             const auto victim = std::find_if(regions.begin(), regions.end(), [](const auto& region) {
                 return region->sealed && !region->building && !region->retired;
             });
             if (victim != regions.end())
                 Retire(**victim);
-            Collect();
         }
         if (statistics.allocated_bytes + config.region_size > config.capacity_bytes)
             return nullptr;
-        auto region = std::make_unique<SharedRegion>(*compile_config, config.region_size);
-        regions.push_back(std::move(region));
-        current = regions.back().get();
+        // Charge the reservation before releasing the mutex. Other workers
+        // must count an in-flight construction against the physical limit.
+        // Construct its list node outside the lock too, so acceptance below
+        // cannot fail after exposing the allocation or leaking its charge.
+        std::list<std::unique_ptr<SharedRegion>> created;
+        const auto construction_revision = revision.load(std::memory_order_relaxed);
         statistics.allocated_bytes += config.region_size;
+        lock.unlock();
+        try {
+            // compile_config is set by the first Attach and then immutable.
+            // Workers retain only WorkerConfig, never execution callbacks.
+            created.push_back(std::make_unique<SharedRegion>(*compile_config, config.region_size));
+            auto* source = created.front().get();
+            source->emitter.SetSharedGeneration(&generation);
+            source->emitter.SetSharedLinkResolver([this, source](u64 location, std::atomic<const void*>* cell, const void* fallback) {
+                RegisterIncoming(*source, location, cell, fallback);
+            });
+        } catch (...) {
+            // Even partial/prelude destruction may unmap native memory. Keep
+            // that work outside the mutex, and keep its reservation charged
+            // until every successfully constructed object is gone.
+            created.clear();
+            lock.lock();
+            statistics.allocated_bytes -= config.region_size;
+            changed.notify_all();
+            throw;
+        }
+        lock.lock();
+        if (stopping || construction_revision != revision.load(std::memory_order_relaxed)) {
+            // A concurrent Clear must not leave an unpublished empty region
+            // resident, and its canceled job must never execute afterward.
+            lock.unlock();
+            created.clear();
+            lock.lock();
+            statistics.allocated_bytes -= config.region_size;
+            changed.notify_all();
+            return nullptr;
+        }
+        regions.splice(regions.end(), created);
+        current = regions.back().get();
         return current;
     }
 
@@ -249,14 +422,29 @@ struct SharedCodeCache::Impl {
         const auto& conf = *compile_config;
         const LocationDescriptor location{IR::LocationDescriptor{job.location}};
         const auto first_pc = location.PC();
+        std::vector<std::uint64_t> guest_words;
+        guest_words.reserve(job.instructions.size() + job.successors.size());
+        // Include the entry even for a translated instruction-fetch fault.
+        guest_words.push_back(first_pc);
         const auto get_code = [&](std::uint64_t pc) -> std::optional<std::uint32_t> {
-            if (pc < first_pc || ((pc - first_pc) & 3) != 0)
+            if ((pc & 3) != 0)
                 return std::nullopt;
-            const auto offset = (pc - first_pc) / 4;
-            return offset < job.instructions.size() ? job.instructions[offset] : std::nullopt;
+            std::optional<std::uint32_t> instruction;
+            if (pc >= first_pc && (pc - first_pc) / 4 < job.instructions.size()) {
+                instruction = job.instructions[(pc - first_pc) / 4];
+            } else {
+                const auto found = std::lower_bound(job.successors.begin(), job.successors.end(), pc,
+                    [](const auto& word, std::uint64_t address) { return word.first < address; });
+                if (found != job.successors.end() && found->first == pc)
+                    instruction = found->second;
+            }
+            if (instruction)
+                guest_words.push_back(pc);
+            return instruction;
         };
-        IR::Block ir = Translate(location, get_code,
-            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions});
+        IR::Block ir = TranslateTrace(location, get_code,
+            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions},
+            conf.HasOptimization(OptimizationFlag::GetSetElimination) && conf.HasOptimization(OptimizationFlag::ConstProp));
         if (OptimizableTerminal(ir.GetTerminal())) {
             Optimization::PolyfillPass(ir, {
                 .sha256 = !region.code.HasHostFeature(HostFeature::SHA),
@@ -264,8 +452,8 @@ struct SharedCodeCache::Impl {
             });
             Optimization::A64CallbackConfigPass(ir, conf);
             Optimization::NamingPass(ir);
-            if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-                Optimization::A64GetSetElimination(ir);
+            if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
+                Optimization::A64GetSetElimination(ir, conf.check_halt_on_memory_access);
                 Optimization::DeadCodeElimination(ir);
             }
             if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
@@ -278,9 +466,22 @@ struct SharedCodeCache::Impl {
 #endif
             region.code.EnsureMemoryCommitted(1024 * 1024);
             const auto block = region.emitter.Emit(ir);
-            const auto end_pc = LocationDescriptor{ir.EndLocation()}.PC();
-            return std::make_unique<SharedPublishedBlock>(SharedPublishedBlock{
-                job.location, block.entrypoint, first_pc, end_pc - 1});
+            auto result = std::make_unique<SharedPublishedBlock>(SharedPublishedBlock{
+                job.location, block.entrypoint, first_pc, first_pc + 3});
+            std::sort(guest_words.begin(), guest_words.end());
+            guest_words.erase(std::unique(guest_words.begin(), guest_words.end()), guest_words.end());
+            result->guest_ranges.reserve(guest_words.size());
+            for (const auto pc : guest_words) {
+                if (!result->guest_ranges.empty() && result->guest_ranges.back().last != std::numeric_limits<u64>::max() &&
+                    result->guest_ranges.back().last + 1 == pc) {
+                    result->guest_ranges.back().last = pc + 3;
+                } else {
+                    result->guest_ranges.push_back({pc, pc + 3});
+                }
+            }
+            result->guest_start = result->guest_ranges.front().first;
+            result->guest_end = result->guest_ranges.back().last;
+            return result;
         }
         return nullptr;
     }
@@ -295,23 +496,93 @@ struct SharedCodeCache::Impl {
         for (;;) {
             SharedCodeSnapshot job;
             SharedRegion* region = nullptr;
+            Reclamation reclamation;
+            bool have_job = false;
             {
                 std::unique_lock lock(mutex);
-                changed.wait(lock, [&] { return stopping || !queue.empty(); });
+                for (;;) {
+                    if (stopping)
+                        return;
+                    reclamation = TakeRetiredRegion();
+                    if (reclamation.region || !queue.empty())
+                        break;
+                    if (retired_regions != 0) {
+                        // Unpin stays a read-mostly-path store, with no mutex,
+                        // notification or shared RMW. Poll epochs only while
+                        // there is actual retirement debt to collect.
+                        changed.wait_for(lock, std::chrono::milliseconds(1));
+                    } else {
+                        changed.wait(lock, [&] { return stopping || !queue.empty() || retired_regions != 0; });
+                    }
+                }
+                if (!reclamation.region) {
+                    have_job = true;
+                    const auto queued_for = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - queue.front().enqueued).count());
+                    statistics.queue_wait_nanoseconds += queued_for;
+                    statistics.queue_wait_max_nanoseconds = std::max(statistics.queue_wait_max_nanoseconds, queued_for);
+                    job = std::move(queue.front().snapshot);
+                    queue.pop_front();
+                    if (job.revision != revision.load(std::memory_order_relaxed)) {
+                        pending.erase(job.location);
+                        ++statistics.discarded_jobs;
+                        continue;
+                    }
+                    try {
+                        region = RegionFor(worker, lock);
+                    } catch (...) {
+                        pending.erase(job.location);
+                        ++statistics.failed_jobs;
+                        continue;
+                    }
+                    // Region construction releases the mutex. Clear or stop
+                    // may have canceled this snapshot while it was outside.
+                    if (stopping)
+                        return;
+                    if (job.revision != revision.load(std::memory_order_relaxed)) {
+                        pending.erase(job.location);
+                        ++statistics.discarded_jobs;
+                        continue;
+                    }
+                    if (!region) {
+                        // RegionFor may just have retired one victim. Keep the
+                        // admitted snapshot while reclaiming it outside the
+                        // lock, then retry once without resnapshotting code.
+                        reclamation = TakeRetiredRegion();
+                        if (!reclamation.region) {
+                            pending.erase(job.location);
+                            ++statistics.dropped_jobs;
+                            continue;
+                        }
+                    } else {
+                        region->building = true;
+                    }
+                }
+            }
+            if (reclamation.region) {
+                ReclaimRegion(std::move(reclamation));
+                if (!have_job)
+                    continue;
+                std::unique_lock lock(mutex);
                 if (stopping)
                     return;
-                job = std::move(queue.front());
-                queue.pop_front();
                 if (job.revision != revision.load(std::memory_order_relaxed)) {
                     pending.erase(job.location);
                     ++statistics.discarded_jobs;
                     continue;
                 }
                 try {
-                    region = RegionFor(worker);
+                    region = RegionFor(worker, lock);
                 } catch (...) {
                     pending.erase(job.location);
                     ++statistics.failed_jobs;
+                    continue;
+                }
+                if (stopping)
+                    return;
+                if (job.revision != revision.load(std::memory_order_relaxed)) {
+                    pending.erase(job.location);
+                    ++statistics.discarded_jobs;
                     continue;
                 }
                 if (!region) {
@@ -340,21 +611,21 @@ struct SharedCodeCache::Impl {
                 }
                 compilation_nanoseconds += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_started).count());
-                // Pack already queued work into the same writable tail. A
-                // page is sealed once for the batch, before any entry becomes
-                // visible. A bounded 1 ms window also packs sparse producers;
-                // execution never waits for this worker's publication.
+                // Pack work that is already queued, then publish promptly.
+                // Waiting an extra millisecond for hypothetical future jobs
+                // made optimization arrive after many short invocations ended.
                 if (emission_failed || count == publications.size() ||
                     region->code.SpaceRemaining() < 1024 * 1024 ||
                     std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1))
                     break;
                 std::unique_lock lock(mutex);
-                changed.wait_until(lock, started + std::chrono::milliseconds(1), [&] {
-                    return stopping || !queue.empty() || region->retire_requested;
-                });
                 if (stopping || queue.empty() || region->retire_requested)
                     break;
-                job = std::move(queue.front());
+                const auto queued_for = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - queue.front().enqueued).count());
+                statistics.queue_wait_nanoseconds += queued_for;
+                statistics.queue_wait_max_nanoseconds = std::max(statistics.queue_wait_max_nanoseconds, queued_for);
+                job = std::move(queue.front().snapshot);
                 queue.pop_front();
             }
             const auto seal_started = std::chrono::steady_clock::now();
@@ -396,16 +667,34 @@ struct SharedCodeCache::Impl {
                     } else {
                         const auto* published = result.get();
                         try {
+                            if (result->guest_ranges.empty())
+                                result->guest_ranges.push_back({result->guest_start, result->guest_end});
+                            if (result->guest_ranges.size() > SharedPublishedBlock::maximum_guest_ranges)
+                                throw std::length_error("shared translation has too many guest ranges");
+                            for (auto& range : result->guest_ranges) {
+                                if (range.first > range.last)
+                                    throw std::invalid_argument("shared translation has an invalid guest range");
+                                range.owner = published;
+                            }
                             region->records.push_back(std::move(result));
                             try {
-                                completed.insert_or_assign(publication.location, published);
+                                for (const auto& range : published->guest_ranges)
+                                    published_ranges.Add(range.first, range.last, RangeKey(range));
+                                if (!completed.emplace(publication.location, published).second)
+                                    throw std::logic_error("duplicate shared translation publication");
                             } catch (...) {
+                                // Remove uses no allocation. A partial index
+                                // insertion or failed completed-map allocation
+                                // cannot leave pointers into a freed vector.
+                                for (const auto& range : published->guest_ranges)
+                                    published_ranges.Remove(RangeKey(range));
                                 region->records.pop_back();
                                 throw;
                             }
                             // Finalized pages and immutable fault records precede
                             // the release publication of the executable address.
                             PublishIndex(published);
+                            UpdateIncoming(publication.location, published->entrypoint);
                             statistics.live_blocks = completed.size();
                             ++statistics.compiled_blocks;
                         } catch (...) {
@@ -420,33 +709,68 @@ struct SharedCodeCache::Impl {
                         if (ptr == region) ptr = nullptr;
                     Retire(*region);
                 }
-                Collect();
             }
         }
     }
 
     void Invalidate(std::uint64_t address, std::size_t length, bool all) {
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         revision.fetch_add(1, std::memory_order_release);
         // All pending snapshots are conservatively invalidated. Published
         // unrelated blocks survive range invalidation.
         for (const auto& job : queue)
-            pending.erase(job.location);
+            pending.erase(job.snapshot.location);
         statistics.discarded_jobs += queue.size();
         queue.clear();
         rejected.clear();
-        for (std::size_t i = 0; i < config.max_blocks; ++i) {
-            const auto* record = index[i].load(std::memory_order_relaxed);
-            if (record && (all || Overlaps(record->guest_start, record->guest_end, address, length))) {
-                index[i].store(nullptr, std::memory_order_release);
+        const auto remove_record = [&](const SharedPublishedBlock* record) {
+            const auto first = Slot(record->location);
+            for (std::size_t way = 0; way < 4; ++way) {
+                auto& slot = index[first + way];
+                if (slot.load(std::memory_order_relaxed) == record)
+                    slot.store(nullptr, std::memory_order_release);
             }
-        }
-        for (auto it = completed.begin(); it != completed.end();) {
-            const auto* record = it->second;
-            if (all || Overlaps(record->guest_start, record->guest_end, address, length))
-                it = completed.erase(it);
-            else
-                ++it;
+            UpdateIncoming(record->location, nullptr);
+        };
+        if (all) {
+            for (const auto& [location, record] : completed)
+                remove_record(record);
+            completed.clear();
+            published_ranges.Clear();
+        } else {
+            std::vector<const SharedPublishedBlock*> affected;
+            const auto find_range = [&](u64 first, u64 last) {
+                for (const auto key : published_ranges.FindOverlaps(first, last)) {
+                    const auto* record = RangeOwner(key);
+                    const auto found = completed.find(record->location);
+                    if (found != completed.end() && found->second == record)
+                        affected.push_back(record);
+                }
+            };
+            const u64 last = address + static_cast<u64>(length - 1);
+            if (last >= address) {
+                find_range(address, last);
+            } else {
+                find_range(address, std::numeric_limits<u64>::max());
+                find_range(0, last);
+            }
+            std::sort(affected.begin(), affected.end(), [](const auto* a, const auto* b) {
+                return a->location < b->location;
+            });
+            affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+            std::vector<std::uint64_t> range_keys;
+            range_keys.reserve(affected.size());
+            for (const auto* record : affected) {
+                for (const auto& range : record->guest_ranges)
+                    range_keys.push_back(RangeKey(range));
+            }
+            // Finish every allocation before unpublishing anything. Compact
+            // each touched page once even if many traces share disjoint code.
+            published_ranges.RemoveMany(range_keys);
+            for (const auto* record : affected) {
+                remove_record(record);
+                completed.erase(record->location);
+            }
         }
         statistics.live_blocks = completed.size();
         generation.fetch_add(1, std::memory_order_seq_cst);
@@ -461,7 +785,8 @@ struct SharedCodeCache::Impl {
                 }
             }
         }
-        Collect();
+        lock.unlock();
+        changed.notify_all();
     }
 
     const SharedCodeCacheConfig config;
@@ -476,15 +801,20 @@ struct SharedCodeCache::Impl {
     std::optional<UserConfig> compile_config;
     std::vector<std::thread> workers;
     std::vector<SharedCacheReader*> readers;
-    std::deque<SharedCodeSnapshot> queue;
+    std::deque<QueuedJob> queue;
     std::unordered_map<std::uint64_t, std::uint64_t> pending;
     std::unordered_map<std::uint64_t, std::uint64_t> rejected;
     std::list<std::unique_ptr<SharedRegion>> regions;
     std::vector<SharedRegion*> active;
     std::vector<std::uint8_t> replacement;
+    // Includes regions detached for worker destruction. It reaches zero only
+    // after their physical memory has been released and the budget debited.
+    std::size_t retired_regions = 0;
     // Bounded by resident regions, not by guest address-space history. A native
     // index collision does not cause duplicate compilation of resident code.
     std::unordered_map<std::uint64_t, const SharedPublishedBlock*> completed;
+    Backend::PageRangeIndex<u64> published_ranges;
+    std::unordered_map<std::uint64_t, IncomingLink*> incoming;
     SharedCodeCacheStatistics statistics;
 };
 
@@ -515,10 +845,12 @@ std::unique_ptr<SharedCacheReader> SharedCodeCacheAccess::Attach(SharedCodeCache
 }
 void SharedCodeCacheAccess::Detach(SharedCodeCache& cache, SharedCacheReader& reader) {
     reader.epoch.store(0, std::memory_order_seq_cst);
-    std::lock_guard lock(cache.impl->mutex);
-    auto& readers = cache.impl->readers;
-    readers.erase(std::remove(readers.begin(), readers.end(), &reader), readers.end());
-    cache.impl->Collect();
+    {
+        std::lock_guard lock(cache.impl->mutex);
+        auto& readers = cache.impl->readers;
+        readers.erase(std::remove(readers.begin(), readers.end(), &reader), readers.end());
+    }
+    cache.impl->changed.notify_all();
 }
 std::uint64_t SharedCodeCacheAccess::Pin(SharedCodeCache& cache, SharedCacheReader& reader) {
     for (;;) {
@@ -542,14 +874,75 @@ const void* SharedCodeCacheAccess::DispatchTable(const SharedCodeCache& cache) {
 std::uint64_t SharedCodeCacheAccess::DispatchMask(const SharedCodeCache& cache) { return cache.impl->config.max_blocks / 4 - 1; }
 std::uint64_t SharedCodeCacheAccess::Revision(const SharedCodeCache& cache) { return cache.impl->revision.load(std::memory_order_acquire); }
 const void* SharedCodeCacheAccess::Lookup(const SharedCodeCache& cache, std::uint64_t location) {
-    const auto first = cache.impl->Slot(location);
+    auto& self = *cache.impl;
+    const auto first = self.Slot(location);
     for (std::size_t i = 0; i < 4; ++i) {
-        const auto* block = cache.impl->index[first + i].load(std::memory_order_acquire);
+        const auto* block = self.index[first + i].load(std::memory_order_acquire);
         if (block && block->location == location)
             return block->entrypoint;
     }
-    return nullptr;
+    // Native-index eviction does not retire the underlying optimized code.
+    // On a genuine C++ miss, reuse an existing publication immediately instead
+    // of waiting for baseline sampling to rediscover it. Never wait behind a
+    // worker: an unavailable scheduler still leaves execution on baseline.
+    std::unique_lock lock(self.mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return nullptr;
+    const auto found = self.completed.find(location);
+    if (found == self.completed.end())
+        return nullptr;
+    self.PublishIndex(found->second);
+    return found->second->entrypoint;
 }
+void SharedCodeCacheAccess::Capture(SharedCodeSnapshot& snapshot, UserCallbacks& callbacks) {
+    const LocationDescriptor location{IR::LocationDescriptor{snapshot.location}};
+    const auto first_pc = location.PC();
+    snapshot.instructions = {};
+    snapshot.successors.clear();
+    for (std::size_t i = 0; i < snapshot.instructions.size(); ++i) {
+        const auto pc = first_pc + i * 4;
+        if (pc < first_pc)
+            break;
+        snapshot.instructions[i] = callbacks.MemoryReadCode(pc);
+        if (!snapshot.instructions[i])
+            break;
+    }
+    const auto captured = [&](std::uint64_t pc) {
+        if (pc >= first_pc && (pc - first_pc) / 4 < snapshot.instructions.size())
+            return true;
+        return std::any_of(snapshot.successors.begin(), snapshot.successors.end(),
+            [=](const auto& word) { return word.first == pc; });
+    };
+    const auto capture_successor = [&](std::uint64_t pc, std::uint32_t instruction) {
+        if ((instruction & 0x7c000000u) != 0x14000000u)
+            return;
+        const auto displacement = static_cast<std::int64_t>(static_cast<std::int32_t>(instruction << 6)) / 16;
+        const auto target = location.SetPC(pc + displacement).PC();
+        // Leave indirect targets outside the snapshot as dispatch edges. A
+        // direct successor needs at most a short block; the whole capture has
+        // an additional fixed 64-word budget regardless of branch fan-out.
+        for (std::size_t i = 0; i < 32 && snapshot.successors.size() < 64; ++i) {
+            const auto address = target + i * 4;
+            if (address < target || captured(address))
+                break;
+            const auto word = callbacks.MemoryReadCode(address);
+            if (!word)
+                break;
+            snapshot.successors.emplace_back(address, *word);
+        }
+    };
+    for (std::size_t i = 0; i < snapshot.instructions.size(); ++i) {
+        if (snapshot.instructions[i])
+            capture_successor(first_pc + i * 4, *snapshot.instructions[i]);
+    }
+    for (std::size_t i = 0; i < snapshot.successors.size() && snapshot.successors.size() < 64; ++i) {
+        // Copy before capture_successor can reallocate the vector.
+        const auto word = snapshot.successors[i];
+        capture_successor(word.first, word.second);
+    }
+    std::sort(snapshot.successors.begin(), snapshot.successors.end());
+}
+
 bool SharedCodeCacheAccess::Request(SharedCodeCache& cache, SharedCodeSnapshot job) {
     auto& self = *cache.impl;
     std::unique_lock lock(self.mutex, std::try_to_lock);
@@ -574,19 +967,25 @@ bool SharedCodeCacheAccess::Request(SharedCodeCache& cache, SharedCodeSnapshot j
     }
     if (self.rejected.contains(job.location))
         return false;
-    if (self.pending.size() >= self.config.max_pending_jobs) {
+    // Keep the speculative backlog to at most one full batch per worker.
+    // A large configured maximum is a memory ceiling, not a request to spend
+    // milliseconds compiling an obsolete FIFO before current hot work.
+    const auto admission_limit = std::min(self.config.max_pending_jobs, self.config.worker_count * std::size_t{32});
+    if (self.pending.size() >= admission_limit) {
         ++self.statistics.dropped_jobs;
         return false;
     }
     try {
         self.pending.emplace(job.location, job.revision);
-        self.queue.push_back(std::move(job));
+        self.queue.push_back({std::move(job), std::chrono::steady_clock::now()});
     } catch (...) {
         self.pending.erase(job.location);
         ++self.statistics.dropped_jobs;
         return false;
     }
     ++self.statistics.queued_jobs;
+    self.statistics.pending_high_water = std::max(self.statistics.pending_high_water,
+        static_cast<std::uint64_t>(self.pending.size()));
     lock.unlock();
     self.changed.notify_one();
     return true;

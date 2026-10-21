@@ -47,6 +47,16 @@ struct TranslationOptions {
 IR::Block Translate(LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options);
 
 /**
+ * Forms a bounded straight-line trace through unconditional branches. Code
+ * must come from an immutable snapshot. A missing successor, a conditional
+ * edge, a repeated PC or the 64-instruction budget ends the trace. Constant
+ * indirect targets are followed only when the relevant optimizations are
+ * enabled; architectural register and precise memory-fault state is retained.
+ */
+IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code,
+                         TranslationOptions options, bool constant_branches = true);
+
+/**
  * This function translates a single provided instruction into our intermediate representation.
  * @param block The block to append the IR for the instruction to.
  * @param descriptor The location of the instruction. Includes information like PC, FPCR state, &c.

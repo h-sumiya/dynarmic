@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -53,6 +54,12 @@ public:
      * @note block is modified.
      */
     BlockDescriptor Emit(IR::Block& block);
+    // Register source-owned mutable link data; generated branch bytes remain
+    // immutable and the cache updates only the pointed-to atomic cell.
+    void SetSharedLinkResolver(std::function<void(u64, std::atomic<const void*>*, const void*)> resolver) {
+        shared_link_resolver = std::move(resolver);
+    }
+    void SetSharedGeneration(const std::atomic<u64>* value) { shared_generation = value; }
     BlockDescriptor EmitBaseline(A64::LocationDescriptor location, const A64BaselineBlock& block);
     // Call from the immutable thread dispatcher before EmitBaseline. The
     // returned retirements require the owner to reset its RSB and hot samples.
@@ -61,6 +68,7 @@ public:
     void ResetBaselineCache() { baseline_cache.Reset(); }
     const void* GetBaselineReturn() const { return baseline_return; }
     const void* GetBaselineHotReturn() const { return baseline_hot_return; }
+    const void* GetSharedIndirectLookup() const { return shared_indirect_lookup; }
 
     void ClearCache() override;
 
@@ -106,6 +114,7 @@ protected:
     void GenBaselineReturn();
     const void* baseline_return = nullptr;
     const void* baseline_hot_return = nullptr;
+    const void* shared_indirect_lookup = nullptr;
 
     // Only the owning execution thread reads or changes this arena metadata.
     // Shared optimized emitters never allocate from it.
@@ -156,8 +165,32 @@ protected:
         return MakeA64Callback<callback>(conf.callbacks, shared_optimized);
     }
     void EmitSharedDispatch();
+    std::function<void(u64, std::atomic<const void*>*, const void*)> shared_link_resolver;
+    const std::atomic<u64>* shared_generation = nullptr;
+    void EmitSharedGeneration(Xbyak::Reg64 target);
+    void EmitSharedPCValue(Xbyak::Reg64 target);
+    void EmitSharedPCFlush();
+    void PrepareSharedDispatch(IR::Block& block);
+    void EmitSharedLinkFallback(IR::LocationDescriptor target);
+    void EmitSharedReturn(IR::LocationDescriptor initial_location, bool is_single_step);
+    void EmitSharedIndirect(IR::LocationDescriptor initial_location, bool is_single_step);
+    void EmitSharedDispatchCacheIndex(Xbyak::Reg64 index, Xbyak::Reg64 location, Xbyak::Reg64 scratch);
+    void EmitSharedDispatchCacheFill(Xbyak::Reg64 entrypoint, Xbyak::Reg64 location);
     void EmitSharedLink(IR::LocationDescriptor next, IR::LocationDescriptor initial_location, bool is_single_step);
+    std::optional<IR::LocationDescriptor> shared_static_dispatch;
+    const IR::Inst* shared_static_pc_inst = nullptr;
+    const IR::Inst* shared_dynamic_pc_inst = nullptr;
+    bool shared_pc_in_r11 = false;
+    bool shared_static_fpcr = false;
     CodePtr shared_block_entrypoint = nullptr;
+    // A pure shared loop can retain selected architectural GPRs across its
+    // self edge. External entries initialize them; all exits materialize them.
+    std::array<std::optional<HostLoc>, 31> shared_loop_registers{};
+    bool shared_loop_flags = false;
+    void PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_order);
+    void EmitSharedLoopEntry();
+    void EmitSharedLoopFlush();
+
     void EmitRuntimeConfigPointer(Xbyak::Reg64 target);
     void EmitRuntimeReservationPointer(Xbyak::Reg64 target);
 

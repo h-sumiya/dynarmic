@@ -6,6 +6,7 @@
 #pragma once
 
 #include <set>
+#include <span>
 
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
@@ -27,6 +28,7 @@ public:
     void AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location);
     void ClearCache();
     void RemoveLocations(const tsl::robin_set<IR::LocationDescriptor>& locations);
+    void RemoveLocations(std::span<const u64> locations);
     tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
 
 private:

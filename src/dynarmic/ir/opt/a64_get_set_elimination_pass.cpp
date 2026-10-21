@@ -15,7 +15,7 @@
 
 namespace Dynarmic::Optimization {
 
-void A64GetSetElimination(IR::Block& block) {
+void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -72,6 +72,21 @@ void A64GetSetElimination(IR::Block& block) {
     };
 
     for (auto inst = block.begin(); inst != block.end(); ++inst) {
+        // A memory callback may halt at this instruction. Keep every preceding
+        // architectural write visible in that case, but continue optimizing
+        // the independent arithmetic stretches on either side of the access.
+        const auto opcode = inst->GetOpcode();
+        const bool observer = inst->IsMemoryReadOrWrite() || inst->CausesCPUException() ||
+            opcode == IR::Opcode::CallHostFunction || opcode == IR::Opcode::A64GetCNTPCT ||
+            opcode == IR::Opcode::A64DataCacheOperationRaised ||
+            opcode == IR::Opcode::A64InstructionCacheOperationRaised ||
+            opcode == IR::Opcode::A64InstructionSynchronizationBarrier;
+        if (preserve_memory_fault_state && observer) {
+            reg_info = {};
+            vec_info = {};
+            sp_info = {};
+            nzcv_info = {};
+        }
         switch (inst->GetOpcode()) {
         case IR::Opcode::A64GetW: {
             const size_t index = A64::RegNumber(inst->GetArg(0).GetA64RegRef());

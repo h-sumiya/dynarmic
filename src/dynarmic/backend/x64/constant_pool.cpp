@@ -39,4 +39,13 @@ Xbyak::Address ConstantPool::GetConstant(const Xbyak::AddressFrame& frame, u64 l
     return frame[code.rip + iter->second];
 }
 
+void* ConstantPool::AllocateMutableData(size_t bytes) {
+    const size_t slots = bytes / align_size + ((bytes % align_size) != 0);
+    if (slots > pool.size() - insertion_point)
+        throw Xbyak::Error(Xbyak::ERR_CODE_IS_TOO_BIG);
+    auto* result = pool.data() + insertion_point;
+    insertion_point += slots;
+    return result;
+}
+
 }  // namespace Dynarmic::Backend::X64

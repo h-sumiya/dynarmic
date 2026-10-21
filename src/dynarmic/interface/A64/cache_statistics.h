@@ -35,6 +35,8 @@ struct CacheStatistics {
     std::uint64_t baseline_reclaimed_blocks = 0;
     std::uint64_t baseline_reclaimed_bytes = 0;
     std::uint64_t baseline_reclaimed_segments = 0;
+    std::uint64_t baseline_reclamation_nanoseconds = 0;
+    std::uint64_t baseline_reclamation_max_nanoseconds = 0;
     // Slow-path observations only. Native shared-index hits intentionally do
     // not increment a contended shared counter.
     std::uint64_t shared_cache_hits = 0;

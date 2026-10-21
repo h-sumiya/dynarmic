@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/A64/shared_code_cache.h"
@@ -22,15 +24,30 @@ struct SharedCodeSnapshot {
     std::uint64_t location = 0;
     std::uint64_t revision = 0;
     std::array<std::optional<std::uint32_t>, 64> instructions;
+    // Additional immutable words at non-contiguous direct successors. The
+    // capture budget is fixed; workers never dereference guest memory.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> successors;
 };
 
 // Prefix layout is consumed by GenBaselineReturn. Records are immutable once
 // their pointer is release-published to the fixed dispatch index.
+struct SharedPublishedBlock;
+struct SharedGuestRange {
+    std::uint64_t first;
+    std::uint64_t last; // inclusive
+    const SharedPublishedBlock* owner = nullptr; // finalized before publication
+};
+
 struct SharedPublishedBlock {
+    static constexpr std::size_t maximum_guest_ranges = 128;
     std::uint64_t location;
     const void* entrypoint;
     std::uint64_t guest_start;
     std::uint64_t guest_end; // inclusive
+    // Exact disjoint guest instruction ranges. Empty vectors retain the
+    // contiguous guest_start/end compatibility form. Neither the vector nor
+    // its addresses may change after it is indexed for publication.
+    std::vector<SharedGuestRange> guest_ranges{};
 };
 static_assert(offsetof(SharedPublishedBlock, entrypoint) == 8);
 static_assert(std::atomic<const SharedPublishedBlock*>::is_always_lock_free);
@@ -53,6 +70,7 @@ struct SharedCodeCacheAccess {
     static std::uint64_t DispatchMask(const SharedCodeCache&);
     static std::uint64_t Revision(const SharedCodeCache&);
     static const void* Lookup(const SharedCodeCache&, std::uint64_t location);
+    static void Capture(SharedCodeSnapshot&, UserCallbacks&);
     // Nonblocking admission: if the scheduler is busy/full, simply try later.
     static bool Request(SharedCodeCache&, SharedCodeSnapshot);
 };

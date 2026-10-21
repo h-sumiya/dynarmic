@@ -34,8 +34,14 @@ void BlockRangeInformation<ProgramCounterType>::ClearCache() {
 template<typename ProgramCounterType>
 void BlockRangeInformation<ProgramCounterType>::RemoveLocations([[maybe_unused]] const tsl::robin_set<IR::LocationDescriptor>& locations) {
 #if A2E_DYNARMIC_PAGE_RANGE_INDEX
-    for (const auto& location : locations)
-        block_ranges.Remove(location.Value());
+    block_ranges.RemoveMany(locations, [](const auto& location) { return location.Value(); });
+#endif
+}
+
+template<typename ProgramCounterType>
+void BlockRangeInformation<ProgramCounterType>::RemoveLocations([[maybe_unused]] std::span<const u64> locations) {
+#if A2E_DYNARMIC_PAGE_RANGE_INDEX
+    block_ranges.RemoveMany(locations);
 #endif
 }
 

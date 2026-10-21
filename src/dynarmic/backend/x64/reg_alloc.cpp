@@ -646,6 +646,19 @@ void RegAlloc::Exchange(HostLoc a, HostLoc b) {
 void RegAlloc::MoveOutOfTheWay(HostLoc reg) {
     ASSERT(!LocInfo(reg).IsLocked());
     if (!LocInfo(reg).IsEmpty()) {
+        // A destructive use or a fixed-register instruction need not send
+        // the old value through memory while another host register is free.
+        // Keep it in the same register class, and only consider the current
+        // allocation order: excluded registers may hold page-table/fastmem
+        // bases or loop-carried architectural values.
+        const auto& candidates = HostLocIsGPR(reg) ? gpr_order : xmm_order;
+        const auto available = std::find_if(candidates.begin(), candidates.end(), [&](HostLoc candidate) {
+            return candidate != reg && !LocInfo(candidate).IsLocked() && LocInfo(candidate).IsEmpty();
+        });
+        if (available != candidates.end()) {
+            Move(*available, reg);
+            return;
+        }
         SpillRegister(reg);
     }
 }

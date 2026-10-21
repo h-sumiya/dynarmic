@@ -1,4 +1,10 @@
-    std::unordered_map<u64, u8> hot_samples;
+    struct HotBlockSamples {
+        std::chrono::steady_clock::time_point first_observation{};
+        std::chrono::steady_clock::time_point next_request{};
+        u32 observations = 0;
+        u8 retry_shift = 0;
+    };
+    std::unordered_map<u64, HotBlockSamples> hot_samples;
     u32 hot_sample_sequence = 1;
 
     void InitializeBaselineState() {
@@ -10,6 +16,7 @@
         jit_state.baseline_return = emitter.GetBaselineReturn();
         jit_state.baseline_hot_return = emitter.GetBaselineHotReturn();
         jit_state.shared_dispatch = emitter.GetBaselineReturn();
+        jit_state.shared_indirect_lookup = emitter.GetSharedIndirectLookup();
         if (shared_reader) {
             jit_state.shared_generation = SharedCodeCacheAccess::Generation(*conf.shared_code_cache);
             jit_state.shared_dispatch_table = SharedCodeCacheAccess::DispatchTable(*conf.shared_code_cache);
@@ -33,7 +40,9 @@
         jit_state.baseline_hot_sample = 0;
         if (sampled) {
             hot_sample_sequence = hot_sample_sequence * 1664525u + 1013904223u;
-            jit_state.baseline_hot_countdown = 64 + (hot_sample_sequence >> 26);
+            // Sparse jittered sampling keeps short loops out of the C++
+            // dispatcher and limits callbacks for short-lived code.
+            jit_state.baseline_hot_countdown = 1024 + (hot_sample_sequence >> 22);
             ++cache_statistics.hot_samples;
         }
 
@@ -44,24 +53,33 @@
                 return optimized;
             }
             if (sampled && conf.enable_baseline_hot_optimization) {
-                auto& hits = hot_samples[current_location.Value()];
-                if (++hits >= 2) {
-                    // Retry periodically: an admitted job can subsequently be
-                    // cancelled by invalidation or capacity backpressure.
-                    hits = 0;
+                using Clock = std::chrono::steady_clock;
+                const auto now = Clock::now();
+                auto& heat = hot_samples[current_location.Value()];
+                if (heat.observations == 0)
+                    heat.first_observation = now;
+                if (heat.observations != std::numeric_limits<u32>::max())
+                    ++heat.observations;
+                // Repetition within a microsecond-long one-shot invocation
+                // is poor evidence for asynchronous compilation: the worker
+                // usually finishes after that code has stopped executing.
+                // Require repeated observations spanning time, then retry
+                // with backoff if publication/capacity is not ready yet.
+                if (heat.observations >= 2 && now >= heat.next_request &&
+                    now - heat.first_observation >= std::chrono::microseconds(50)) {
                     SharedCodeSnapshot snapshot;
                     snapshot.location = current_location.Value();
                     snapshot.revision = SharedCodeCacheAccess::Revision(*conf.shared_code_cache);
-                    for (std::size_t i = 0; i < snapshot.instructions.size(); ++i) {
-                        const u64 pc = location.PC() + i * 4;
-                        if (pc < location.PC())
-                            break;
-                        snapshot.instructions[i] = conf.callbacks->MemoryReadCode(pc);
-                        if (!snapshot.instructions[i])
-                            break;
-                    }
-                    if (SharedCodeCacheAccess::Request(*conf.shared_code_cache, std::move(snapshot)))
+                    SharedCodeCacheAccess::Capture(snapshot, *conf.callbacks);
+                    if (SharedCodeCacheAccess::Request(*conf.shared_code_cache, std::move(snapshot))) {
                         ++cache_statistics.shared_cache_requests;
+                        heat.retry_shift = 0;
+                    } else if (heat.retry_shift < 6) {
+                        ++heat.retry_shift;
+                    }
+                    // Snapshot guest words only once per retry interval, not
+                    // on every sparse sample while the same job is pending.
+                    heat.next_request = now + std::chrono::milliseconds(u64{1} << heat.retry_shift);
                 }
             }
         }
@@ -77,6 +95,13 @@
         const auto translated = conf.enable_cache_statistics ? Clock::now() : Clock::time_point{};
         const auto reclaimed = emitter.PrepareBaselineEmission(block->code.size());
         if (reclaimed.reclaimed_segments != 0) {
+            if (conf.enable_cache_statistics) {
+                const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - translated).count());
+                cache_statistics.baseline_reclamation_nanoseconds += elapsed;
+                cache_statistics.baseline_reclamation_max_nanoseconds = std::max(
+                    cache_statistics.baseline_reclamation_max_nanoseconds, elapsed);
+            }
             jit_state.ResetRSB();
             for (const auto key : reclaimed.evicted_locations)
                 hot_samples.erase(key);

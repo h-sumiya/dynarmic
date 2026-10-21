@@ -54,6 +54,12 @@ public:
     size_t SpaceRemaining() const;
     /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
     void EnsureMemoryCommitted(size_t codesize);
+    // Shared regions keep this near data RW and non-executable for their
+    // lifetime; every native body in the region can use RIP-relative loads.
+    void* AllocateMutableData(size_t bytes) {
+        ASSERT(concurrent_append);
+        return constant_pool.AllocateMutableData(bytes);
+    }
 
     /// Runs emulated code from code_ptr.
     HaltReason RunCode(void* jit_state, CodePtr code_ptr) const;
