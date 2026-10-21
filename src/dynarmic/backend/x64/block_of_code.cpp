@@ -278,6 +278,10 @@ void BlockOfCode::EnableWriting() {
 #endif
 }
 
+bool BlockOfCode::IsCodePageAligned() const {
+    return getSize() % CodePageSize() == 0;
+}
+
 void BlockOfCode::DisableWriting() {
     if (concurrent_append) {
         EnsureMemoryCommitted(CodePageSize());

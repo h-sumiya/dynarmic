@@ -59,7 +59,6 @@ public:
     void SetSharedLinkResolver(std::function<void(u64, std::atomic<const void*>*, const void*)> resolver) {
         shared_link_resolver = std::move(resolver);
     }
-    void SetSharedGeneration(const std::atomic<u64>* value) { shared_generation = value; }
     BlockDescriptor EmitBaseline(A64::LocationDescriptor location, const A64BaselineBlock& block);
     // Call from the immutable thread dispatcher before EmitBaseline. The
     // returned retirements require the owner to reset its RSB and hot samples.
@@ -166,8 +165,6 @@ protected:
     }
     void EmitSharedDispatch();
     std::function<void(u64, std::atomic<const void*>*, const void*)> shared_link_resolver;
-    const std::atomic<u64>* shared_generation = nullptr;
-    void EmitSharedGeneration(Xbyak::Reg64 target);
     void EmitSharedPCValue(Xbyak::Reg64 target);
     void EmitSharedPCFlush();
     void PrepareSharedDispatch(IR::Block& block);

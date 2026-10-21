@@ -18,7 +18,6 @@
         jit_state.shared_dispatch = emitter.GetBaselineReturn();
         jit_state.shared_indirect_lookup = emitter.GetSharedIndirectLookup();
         if (shared_reader) {
-            jit_state.shared_generation = SharedCodeCacheAccess::Generation(*conf.shared_code_cache);
             jit_state.shared_dispatch_table = SharedCodeCacheAccess::DispatchTable(*conf.shared_code_cache);
             jit_state.shared_dispatch_mask = SharedCodeCacheAccess::DispatchMask(*conf.shared_code_cache);
         }
@@ -29,11 +28,10 @@
     }
 
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
-        // Called before entering native code or by a tail-call out of a body
-        // into the permanent private prelude. No native return address can
-        // point into a reclaimable region at this safepoint.
-        if (shared_reader)
-            jit_state.shared_observed_generation = SharedCodeCacheAccess::Pin(*conf.shared_code_cache, *shared_reader);
+        // Every caller is outside shared native code, with return addresses
+        // only in the permanent private prelude. Refresh the epoch here and
+        // discard old hints before any new lookup can expose a reclaimed cell.
+        RefreshSharedCacheReader();
         jit_state.last_lookup_is_shared = 0;
         const A64::LocationDescriptor location{current_location};
         const bool sampled = jit_state.baseline_hot_sample != 0;
@@ -42,7 +40,7 @@
             hot_sample_sequence = hot_sample_sequence * 1664525u + 1013904223u;
             // Sparse jittered sampling keeps short loops out of the C++
             // dispatcher and limits callbacks for short-lived code.
-            jit_state.baseline_hot_countdown = 1024 + (hot_sample_sequence >> 22);
+            jit_state.baseline_hot_countdown = 64 + (hot_sample_sequence >> 26);
             ++cache_statistics.hot_samples;
         }
 

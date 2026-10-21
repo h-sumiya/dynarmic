@@ -293,8 +293,8 @@ struct SharedCodeCache::Impl {
         for (auto*& ptr : active)
             if (ptr == &region) ptr = nullptr;
         RemovePublished(region);
-        // SC epochs close the reader-publication/collector scan race. Native
-        // hot paths only load generation; no shared RMW is emitted there.
+        // SC epochs close the reader-publication/collector scan race. Epoch
+        // refresh occurs only at execution entry and C++ lookup safepoints.
         region.retire_epoch = generation.fetch_add(1, std::memory_order_seq_cst) + 1;
         region.retired = true;
         statistics.retired_bytes += config.region_size;
@@ -388,7 +388,6 @@ struct SharedCodeCache::Impl {
             // Workers retain only WorkerConfig, never execution callbacks.
             created.push_back(std::make_unique<SharedRegion>(*compile_config, config.region_size));
             auto* source = created.front().get();
-            source->emitter.SetSharedGeneration(&generation);
             source->emitter.SetSharedLinkResolver([this, source](u64 location, std::atomic<const void*>* cell, const void* fallback) {
                 RegisterIncoming(*source, location, cell, fallback);
             });
@@ -611,15 +610,21 @@ struct SharedCodeCache::Impl {
                 }
                 compilation_nanoseconds += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_started).count());
-                // Pack work that is already queued, then publish promptly.
-                // Waiting an extra millisecond for hypothetical future jobs
-                // made optimization arrive after many short invocations ended.
+                // Coalesce a partial instruction page within the batch deadline.
+                // Foreground execution continues while the worker releases the lock.
                 if (emission_failed || count == publications.size() ||
                     region->code.SpaceRemaining() < 1024 * 1024 ||
                     std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1))
                     break;
                 std::unique_lock lock(mutex);
-                if (stopping || queue.empty() || region->retire_requested)
+                if (queue.empty() && !region->code.IsCodePageAligned()) {
+                    changed.wait_until(lock, started + std::chrono::milliseconds(1), [&] {
+                        return stopping || !queue.empty() || region->retire_requested ||
+                               job.revision != revision.load(std::memory_order_relaxed);
+                    });
+                }
+                if (stopping || queue.empty() || region->retire_requested ||
+                    job.revision != revision.load(std::memory_order_relaxed))
                     break;
                 const auto queued_for = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - queue.front().enqueued).count());
@@ -869,7 +874,6 @@ void SharedCodeCacheAccess::Unpin(SharedCacheReader& reader) {
     // A collector that still sees the pinned epoch only postpones reclamation.
     reader.epoch.store(0, std::memory_order_release);
 }
-const std::atomic<std::uint64_t>* SharedCodeCacheAccess::Generation(const SharedCodeCache& cache) { return &cache.impl->generation; }
 const void* SharedCodeCacheAccess::DispatchTable(const SharedCodeCache& cache) { return cache.impl->index.get(); }
 std::uint64_t SharedCodeCacheAccess::DispatchMask(const SharedCodeCache& cache) { return cache.impl->config.max_blocks / 4 - 1; }
 std::uint64_t SharedCodeCacheAccess::Revision(const SharedCodeCache& cache) { return cache.impl->revision.load(std::memory_order_acquire); }

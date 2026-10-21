@@ -28,8 +28,8 @@ are separate from the executable-region budget.
 ## Admission and asynchronous compilation
 
 A thread-private countdown samples baseline entries and self-edges. Its initial
-sample is after 96 visits; subsequent intervals are jittered between 1024 and
-2047 visits. A location must be observed at least twice over at least 50 us
+sample is after 96 visits; subsequent intervals are jittered between 64 and
+127 visits. A location must be observed at least twice over at least 50 us
 before a snapshot is considered. This avoids queueing an optimizer for every
 short-lived entry in a broad code scan. Sampling and retry state belong to the
 executing JIT and are removed with its baseline block metadata.
@@ -52,9 +52,11 @@ or instruction budget ends the trace. A missing continuation dispatches to the
 correct PC; it does not synthesize an instruction-fetch fault for code that was
 merely outside the capture window. Single-step remains one guest instruction.
 
-Workers perform the IR optimization passes and pack already-queued blocks into
-batches of at most 32 blocks or 1 ms of compilation work. There is no artificial
-wait to gather a batch. With W^X support enabled, instruction pages are sealed
+Workers perform the IR optimization passes and pack blocks into batches of at
+most 32 blocks within a 1 ms deadline from the first compilation. An incomplete
+instruction page can wait for queued work until that deadline while foreground
+execution continues. Complete pages publish without that wait. With W^X support
+enabled, instruction pages are sealed
 read-execute before publication. Subsequent publications and link updates never
 rewrite those instruction bytes. Writable link cells are in the region's
 separate data pool.
@@ -63,12 +65,12 @@ separate data pool.
 
 A shared direct edge uses a source-owned atomic link cell. Publishing a target
 updates its incoming cells; invalidation or retirement restores their fallback
-addresses. The normal edge checks halt state, optional cycle budget and the
-cache generation, then jumps through the cell. Self-edges can jump directly to
+addresses. The normal edge checks halt state and the optional cycle budget,
+then jumps through the cell. Self-edges can jump directly to
 the loop body. A source's fallback belongs to that source and tail-jumps to the
 executing JIT's permanent prelude, leaving no return address in a retired region.
 
-Dynamic branches use a bounded 32 KiB table of 1024 thread-private hints. Each
+Dynamic branches use a bounded 256 KiB table of 8192 thread-private hints. Each
 site checks two entries, including the complete PC/FPCR descriptor and current
 generation. A miss tail-jumps to a permanent native stub that probes the shared
 index and the private baseline dispatch table before needing a C++ lookup.
@@ -123,12 +125,21 @@ range removes all of the publication's range records. Batch removal compacts
 each affected page bucket once.
 
 Publication removal restores incoming link cells and removes native index
-entries before advancing the reclamation generation. Native code checks that
-generation at its edges. A reader pins its epoch before entering native code
-and changes it only at Run/Step boundaries or permanent-prelude safepoints.
-A callback can return into shared code, so its reader remains pinned throughout
-the callback. A retired executable region and its fastmem fault records remain
-alive until every reader that could have observed it has left that epoch.
+entries before advancing the reclamation generation. Each Run/Step pins its
+reader before the first lookup. A C++ lookup reached by tail-leaving shared code
+can refresh that epoch: its native return address is in the permanent prelude.
+An epoch change clears private shared hints and return-stack entries before
+lookup. Callbacks retain their reader protection because they can return into
+shared code. Native edges do not reload the global generation. A retired region
+and its fault records remain alive until every reader that could have observed
+it has reached such a lookup or returned. A long invocation without lookups can
+postpone reclamation; capacity pressure continues in baseline code within the
+budget. Every Run/Step exit, including exceptions, releases its reader pin.
+
+Shared-cache invalidation removes publications but does not halt attached JITs.
+The embedding owner must stop and synchronize affected JITs before changing
+guest executable bytes or releasing their mappings. Engine invalidation halts
+its JITs and drains their private invalidations at the invocation boundary.
 
 Only optimizer workers physically destroy retired regions. They detach at most
 one eligible region under the scheduler mutex, destroy its executable pages and

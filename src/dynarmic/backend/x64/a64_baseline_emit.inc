@@ -12,14 +12,10 @@ void A64EmitX64::GenBaselineReturn() {
         code.jle(code.GetForceReturnFromRunCodeAddress());
     }
     if (!shared_optimized && conf.shared_code_cache && conf.enable_baseline_hot_optimization) {
-        Xbyak::Label local, refresh, shared_index;
-        // A generation change is handled only here, after tail-leaving the
-        // shared body. Refreshing an epoch from a callback would be unsafe:
-        // its native return address may still name the shared region.
-        code.mov(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_generation)]);
-        code.mov(code.r8, code.qword[code.rax]);
-        code.cmp(code.r8, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
-        code.jne(refresh, code.T_NEAR);
+        Xbyak::Label shared_index;
+        // The reader remains pinned across native edges. C++ lookups refresh
+        // its epoch and reject stale private hints before choosing a target.
+        code.mov(code.r8, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
 
         code.mov(code.rbx, code.qword[code.r15 + offsetof(A64JitState, pc)]);
         code.mov(code.rcx, A64::LocationDescriptor::pc_mask);
@@ -65,11 +61,6 @@ void A64EmitX64::GenBaselineReturn() {
             code.jmp(code.r10);
             code.L(next);
         }
-        code.jmp(local, code.T_NEAR);
-        code.L(refresh);
-        code.LookupBlock();
-        code.jmp(code.rax);
-        code.L(local);
     }
     code.jmp(terminal_handler_fast_dispatch_hint ? terminal_handler_fast_dispatch_hint
                                                : code.GetReturnFromRunCodeAddress());
@@ -83,9 +74,9 @@ void A64EmitX64::GenBaselineReturn() {
 
     code.align();
     shared_indirect_lookup = code.getCurr<const void*>();
-    // Entry comes only from a shared body's tail jump, with RBX naming one
-    // private cache slot. A C++ miss is therefore a permanent-prelude
-    // safepoint: no native return address retains the previous source region.
+    // Entry tail-jumps into this permanent prelude with RBX naming a private
+    // cache slot. No shared return frame remains, so a C++ lookup can advance
+    // the reader epoch and allow the source region to be reclaimed.
     code.cmp(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], 0);
     code.jne(code.GetForceReturnFromRunCodeAddress());
     if (conf.enable_cycle_counting) {
@@ -102,10 +93,6 @@ void A64EmitX64::GenBaselineReturn() {
     code.shl(code.rcx, A64::LocationDescriptor::fpcr_shift);
     code.or_(code.rbp, code.rcx);
     Xbyak::Label lookup, fill_shared;
-    code.mov(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_generation)]);
-    code.mov(code.rax, code.qword[code.rax]);
-    code.cmp(code.rax, code.qword[code.r15 + offsetof(A64JitState, shared_observed_generation)]);
-    code.jne(lookup, code.T_NEAR);
     code.mov(code.rax, code.rbp);
     code.shr(code.rax, 2);
     code.mov(code.rcx, code.rbp);

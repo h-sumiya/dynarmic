@@ -52,9 +52,11 @@ public:
     SharedCodeCache& operator=(const SharedCodeCache&) = delete;
 
     // Removes published targets and cancels stale in-flight snapshots before
-    // returning. Execution already in progress reaches a dispatcher safepoint;
-    // native bytes are retained until its last reader has passed that point.
-    // Guest mapping lifetime is still the embedding application's contract.
+    // returning. Run/Step maintains reader protection through callbacks and
+    // lookups; a lookup tail-entered from shared code may advance its epoch.
+    // Every invocation releases the reader on exit. This cache does not halt
+    // attached Jits. The owner must stop and synchronize affected Jits before
+    // changing executable guest bytes or releasing guest mappings.
     void InvalidateRange(std::uint64_t address, std::size_t length);
     void Clear();
     SharedCodeCacheStatistics GetStatistics() const;

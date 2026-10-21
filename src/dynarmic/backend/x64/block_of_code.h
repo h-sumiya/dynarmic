@@ -47,6 +47,8 @@ public:
     void EnableWriting();
     /// Change permissions to RX. This is required to support systems with W^X enforced.
     void DisableWriting();
+    /// Whether the emitted code ends on an instruction-page boundary.
+    bool IsCodePageAligned() const;
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();

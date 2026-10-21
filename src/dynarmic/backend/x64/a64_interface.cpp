@@ -83,6 +83,17 @@ public:
         InitializeBaselineState();
     }
 
+    void RefreshSharedCacheReader() {
+        if (shared_reader) {
+            const auto epoch = SharedCodeCacheAccess::Pin(*conf.shared_code_cache, *shared_reader);
+            if (epoch != jit_state.shared_observed_generation) {
+                jit_state.ResetSharedDispatchHints();
+                jit_state.ResetRSB();
+                jit_state.shared_observed_generation = epoch;
+            }
+        }
+    }
+
     ~Impl() {
         if (shared_reader)
             SharedCodeCacheAccess::Detach(*conf.shared_code_cache, *shared_reader);
@@ -98,6 +109,8 @@ public:
             if (shared_reader)
                 SharedCodeCacheAccess::Unpin(*shared_reader);
         };
+
+        RefreshSharedCacheReader();
 
         // TODO: Check code alignment
 
@@ -120,6 +133,8 @@ public:
             if (shared_reader)
                 SharedCodeCacheAccess::Unpin(*shared_reader);
         };
+
+        RefreshSharedCacheReader();
 
         const HaltReason hr = block_of_code.StepCode(&jit_state, GetCurrentSingleStep());
 

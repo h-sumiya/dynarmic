@@ -65,7 +65,6 @@ struct SharedCodeCacheAccess {
     static void Detach(SharedCodeCache&, SharedCacheReader&);
     static std::uint64_t Pin(SharedCodeCache&, SharedCacheReader&);
     static void Unpin(SharedCacheReader&);
-    static const std::atomic<std::uint64_t>* Generation(const SharedCodeCache&);
     static const void* DispatchTable(const SharedCodeCache&);
     static std::uint64_t DispatchMask(const SharedCodeCache&);
     static std::uint64_t Revision(const SharedCodeCache&);

@@ -94,20 +94,6 @@ void A64EmitX64::EmitSharedPCFlush() {
         code.mov(qword[r15 + offsetof(A64JitState, pc)], r11);
 }
 
-void A64EmitX64::EmitSharedGeneration(Xbyak::Reg64 target) {
-    if (shared_generation) {
-        // The cache owns both this counter and every executable region. x64's
-        // accumulator moffs form loads it directly, without a dependent load
-        // of the same immutable pointer from every executing Jit's state.
-        code.mov(rax, qword[reinterpret_cast<u64>(shared_generation)]);
-        if (target.getIdx() != rax.getIdx())
-            code.mov(target, rax);
-    } else {
-        code.mov(target, qword[r15 + offsetof(A64JitState, shared_generation)]);
-        code.mov(target, qword[target]);
-    }
-}
-
 void A64EmitX64::PrepareSharedDispatch(IR::Block& block) {
     shared_static_dispatch.reset();
     shared_static_pc_inst = nullptr;
@@ -175,7 +161,7 @@ void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
     if (!is_single_step && (self_edge || cell)) {
         // Mutable link data belongs to the source region. A published target
         // replaces only this atomic cell, never executable instruction bytes.
-        // All edges still test the reclamation generation and halt state.
+        // The enclosing Run/Step pins every target; edges still test halt state.
         Xbyak::Label fallback;
         code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
         code.jne(fallback, code.T_NEAR);
@@ -183,9 +169,6 @@ void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
             code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
             code.jle(fallback, code.T_NEAR);
         }
-        EmitSharedGeneration(rax);
-        code.cmp(rax, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
-        code.jne(fallback, code.T_NEAR);
         if (self_edge) {
             ASSERT(shared_block_entrypoint);
             code.jmp(shared_block_entrypoint);
@@ -253,9 +236,7 @@ void A64EmitX64::EmitSharedIndirect(IR::LocationDescriptor initial_location, boo
         code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
         code.jle(dispatch, code.T_NEAR);
     }
-    EmitSharedGeneration(rdx);
-    code.cmp(rdx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
-    code.jne(dispatch, code.T_NEAR);
+    code.mov(rdx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
     EmitSharedPCValue(rax);
     code.mov(rcx, A64::LocationDescriptor::pc_mask);
     code.and_(rax, rcx);
@@ -283,7 +264,7 @@ void A64EmitX64::EmitSharedIndirect(IR::LocationDescriptor initial_location, boo
         code.L(next);
     }
     // RBX is preserved by the C++ lookup callback. The tail jump is essential:
-    // the owner prelude may refresh the reader epoch and reclaim this source.
+    // the permanent prelude handles the lookup without a shared return frame.
     EmitSharedPCFlush();
     code.mov(ecx, dword[r15 + offset + offsetof(A64JitState::SharedDispatchCacheEntry, replacement)]);
     code.xor_(dword[r15 + offset + offsetof(A64JitState::SharedDispatchCacheEntry, replacement)],
@@ -305,16 +286,14 @@ void A64EmitX64::EmitSharedReturn(IR::LocationDescriptor initial_location, bool 
             code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
             code.jle(fallback, code.T_NEAR);
         }
-        EmitSharedGeneration(rcx);
-        code.cmp(rcx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
-        code.jne(fallback, code.T_NEAR);
+        code.mov(rcx, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
 
         code.mov(eax, dword[r15 + offsetof(A64JitState, shared_rsb_ptr)]);
         code.sub(eax, 1);
         code.and_(eax, u32(A64JitState::RSBPtrMask));
         code.mov(dword[r15 + offsetof(A64JitState, shared_rsb_ptr)], eax);
-        // Check before loading the cell address: its source region may have
-        // retired while a callee passed through a reclamation safepoint.
+        // Check before loading the cell address: execution-entry and lookup
+        // safepoints can advance the reader beyond the source region's epoch.
         code.cmp(qword[r15 + offsetof(A64JitState, shared_rsb_generations) + rax * 8], rcx);
         code.jne(fallback, code.T_NEAR);
         EmitSharedPCValue(rbx);
