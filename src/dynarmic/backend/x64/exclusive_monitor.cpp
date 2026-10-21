@@ -1,3 +1,8 @@
+// A2E_SHARDED_EXCLUSIVE_DISPATCH_V2
+#include "dynarmic/interface/exclusive_monitor.h"
+#if A2E_DYNARMIC_SHARDED_MONITOR
+#include "dynarmic/backend/x64/exclusive_monitor_sharded_impl.inc"
+#else
 /* This file is part of the dynarmic project.
  * Copyright (c) 2018 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -56,3 +61,5 @@ void ExclusiveMonitor::ClearProcessor(size_t processor_id) {
 }
 
 }  // namespace Dynarmic
+
+#endif

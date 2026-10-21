@@ -6,6 +6,8 @@
 #include "dynarmic/backend/x64/reg_alloc.h"
 
 #include <algorithm>
+#include <array>
+#include <span>
 #include <numeric>
 #include <utility>
 
@@ -254,8 +256,8 @@ bool Argument::IsInMemory() const {
 }
 
 RegAlloc::RegAlloc(BlockOfCode& code, std::vector<HostLoc> gpr_order, std::vector<HostLoc> xmm_order)
-        : gpr_order(gpr_order)
-        , xmm_order(xmm_order)
+        : gpr_order(std::move(gpr_order))
+        , xmm_order(std::move(xmm_order))
         , hostloc_info(NonSpillHostLocCount + SpillCount)
         , code(code) {}
 
@@ -309,7 +311,7 @@ OpArg RegAlloc::UseOpArg(Argument& arg) {
 void RegAlloc::Use(Argument& arg, HostLoc host_loc) {
     ASSERT(!arg.allocated);
     arg.allocated = true;
-    UseImpl(arg.value, {host_loc});
+    UseImpl(arg.value, std::span<const HostLoc>{&host_loc, 1});
 }
 
 Xbyak::Reg64 RegAlloc::UseScratchGpr(Argument& arg) {
@@ -327,7 +329,7 @@ Xbyak::Xmm RegAlloc::UseScratchXmm(Argument& arg) {
 void RegAlloc::UseScratch(Argument& arg, HostLoc host_loc) {
     ASSERT(!arg.allocated);
     arg.allocated = true;
-    UseScratchImpl(arg.value, {host_loc});
+    UseScratchImpl(arg.value, std::span<const HostLoc>{&host_loc, 1});
 }
 
 void RegAlloc::DefineValue(IR::Inst* inst, const Xbyak::Reg& reg) {
@@ -353,7 +355,7 @@ Xbyak::Reg64 RegAlloc::ScratchGpr() {
 }
 
 Xbyak::Reg64 RegAlloc::ScratchGpr(HostLoc desired_location) {
-    return HostLocToReg64(ScratchImpl({desired_location}));
+    return HostLocToReg64(ScratchImpl(std::span<const HostLoc>{&desired_location, 1}));
 }
 
 Xbyak::Xmm RegAlloc::ScratchXmm() {
@@ -361,10 +363,10 @@ Xbyak::Xmm RegAlloc::ScratchXmm() {
 }
 
 Xbyak::Xmm RegAlloc::ScratchXmm(HostLoc desired_location) {
-    return HostLocToXmm(ScratchImpl({desired_location}));
+    return HostLocToXmm(ScratchImpl(std::span<const HostLoc>{&desired_location, 1}));
 }
 
-HostLoc RegAlloc::UseImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::UseImpl(IR::Value use_value, std::span<const HostLoc> desired_locations) {
     if (use_value.IsImmediate()) {
         return LoadImmediate(use_value, ScratchImpl(desired_locations));
     }
@@ -396,7 +398,7 @@ HostLoc RegAlloc::UseImpl(IR::Value use_value, const std::vector<HostLoc>& desir
     return destination_location;
 }
 
-HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, std::span<const HostLoc> desired_locations) {
     if (use_value.IsImmediate()) {
         return LoadImmediate(use_value, ScratchImpl(desired_locations));
     }
@@ -423,7 +425,7 @@ HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>
     return destination_location;
 }
 
-HostLoc RegAlloc::ScratchImpl(const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::ScratchImpl(std::span<const HostLoc> desired_locations) {
     const HostLoc location = SelectARegister(desired_locations);
     MoveOutOfTheWay(location);
     LocInfo(location).WriteLock();
@@ -485,7 +487,7 @@ void RegAlloc::HostCall(IR::Inst* result_def,
     }
 
     for (HostLoc caller_saved : other_caller_save) {
-        ScratchImpl({caller_saved});
+        ScratchImpl(std::span<const HostLoc>{&caller_saved, 1});
     }
 }
 
@@ -519,14 +521,17 @@ void RegAlloc::EmitVerboseDebuggingOutput() {
     }
 }
 
-HostLoc RegAlloc::SelectARegister(const std::vector<HostLoc>& desired_locations) const {
-    std::vector<HostLoc> candidates = desired_locations;
+HostLoc RegAlloc::SelectARegister(std::span<const HostLoc> desired_locations) const {
+    std::array<HostLoc, 16> storage;
+    ASSERT(desired_locations.size() <= storage.size());
+    std::copy(desired_locations.begin(), desired_locations.end(), storage.begin());
+    auto candidates = std::span(storage).first(desired_locations.size());
 
     // Find all locations that have not been allocated..
     const auto allocated_locs = std::partition(candidates.begin(), candidates.end(), [this](auto loc) {
         return !this->LocInfo(loc).IsLocked();
     });
-    candidates.erase(allocated_locs, candidates.end());
+    candidates = candidates.first(static_cast<size_t>(allocated_locs - candidates.begin()));
     ASSERT_MSG(!candidates.empty(), "All candidate registers have already been allocated");
 
     // Selects the best location out of the available locations.

@@ -19,6 +19,10 @@ enum class FPExc {
     InputDenorm,
 };
 
+// apk2exe precise baseline FP trap hook. Unset preserves optimizing-tier behavior.
+using BaselineTrapHandler = void (*)(FPExc);
+extern thread_local BaselineTrapHandler baseline_trap_handler;
+
 void FPProcessException(FPExc exception, FPCR fpcr, FPSR& fpsr);
 
 }  // namespace Dynarmic::FP

@@ -49,6 +49,10 @@ enum class Exception {
     /// Attempted to execute a code block at an address for which MemoryReadCode returned std::nullopt.
     /// (Intended to be used to emulate memory protection faults.)
     NoExecuteFault,
+    /// An exclusive memory instruction used a non-naturally-aligned address.
+    AlignmentFault,
+    /// Enabled floating-point exception in the independent baseline.
+    FloatingPointTrap,
 };
 
 enum class DataCacheOperation {
@@ -288,6 +292,11 @@ struct UserConfig {
     // Minimum size is about 8MiB. Maximum size is about 128MiB (arm64 host) or 2GiB (x64 host).
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     size_t code_cache_size = 128 * 1024 * 1024;  // bytes
+
+    /// Enable compile phase timing. Integer cache counters remain available
+    /// without this option; no instrumentation is emitted into guest blocks.
+    bool enable_cache_statistics = false;
+    bool enable_baseline_hot_optimization = true;
 
     /// Internal use only
     bool very_verbose_debugging_output = false;

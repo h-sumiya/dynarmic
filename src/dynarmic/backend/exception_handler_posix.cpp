@@ -178,8 +178,10 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
         if (iter != sig_handler->code_block_infos.end()) {
             FakeCall fc = iter->cb(CTX_RIP);
 
-            CTX_RSP -= sizeof(u64);
-            *mcl::bit_cast<u64*>(CTX_RSP) = fc.ret_rip;
+            if (fc.ret_rip) {
+                CTX_RSP -= sizeof(u64);
+                *mcl::bit_cast<u64*>(CTX_RSP) = fc.ret_rip;
+            }
             CTX_RIP = fc.call_rip;
 
             return;

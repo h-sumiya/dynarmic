@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "dynarmic/interface/A64/config.h"
+#include "dynarmic/interface/A64/cache_statistics.h"
 #include "dynarmic/interface/halt_reason.h"
 
 namespace Dynarmic {
@@ -118,6 +119,9 @@ public:
      * i.e.: We're in a callback.
      */
     bool IsExecuting() const;
+
+    /// Read cumulative cache counters on the owning thread (callbacks allowed).
+    CacheStatistics GetCacheStatistics() const;
 
     /// Debugging: Dump a disassembly all of compiled code to the console.
     void DumpDisassembly() const;

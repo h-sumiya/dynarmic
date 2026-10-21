@@ -3,9 +3,13 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include <boost/icl/interval_set.hpp>
 #include <mcl/assert.hpp>
@@ -63,6 +67,7 @@ public:
             , emitter(block_of_code, conf, jit)
             , polyfill_options(GenPolyfillOptions(block_of_code)) {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
+        InitializeBaselineState();
     }
 
     ~Impl() = default;
@@ -119,16 +124,23 @@ public:
     }
 
     void InvalidateCacheRange(u64 start_address, size_t length) {
+        if (length == 0)
+            return;
         std::unique_lock lock{invalidation_mutex};
         const auto end_address = static_cast<u64>(start_address + length - 1);
-        const auto range = boost::icl::discrete_interval<u64>::closed(start_address, end_address);
-        invalid_cache_ranges.add(range);
+        if (end_address >= start_address) {
+            invalid_cache_ranges.add(boost::icl::discrete_interval<u64>::closed(start_address, end_address));
+        } else {
+            invalid_cache_ranges.add(boost::icl::discrete_interval<u64>::closed(start_address, std::numeric_limits<u64>::max()));
+            invalid_cache_ranges.add(boost::icl::discrete_interval<u64>::closed(0, end_address));
+        }
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
     void Reset() {
         ASSERT(!is_executing);
         jit_state = {};
+        InitializeBaselineState();
     }
 
     void HaltExecution(HaltReason hr) {
@@ -228,6 +240,16 @@ public:
         return is_executing;
     }
 
+    CacheStatistics GetCacheStatistics() const {
+        auto result = cache_statistics;
+        result.live_blocks = emitter.CachedBlockCount();
+        result.fastmem_invalidated_blocks = emitter.FastmemInvalidatedBlockCount();
+        result.cache_capacity_bytes = block_of_code.GetTotalCodeSize();
+        result.cache_used_bytes = result.cache_capacity_bytes - block_of_code.SpaceRemaining();
+        result.cache_high_water_bytes = std::max(result.cache_high_water_bytes, result.cache_used_bytes);
+        return result;
+    }
+
     void DumpDisassembly() const {
         const size_t size = reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin());
         Common::DumpDisassembledX64(block_of_code.GetCodeBegin(), size);
@@ -256,40 +278,7 @@ private:
         return GetBlock(A64::LocationDescriptor{GetCurrentLocation()}.SetSingleStepping(true));
     }
 
-    CodePtr GetBlock(IR::LocationDescriptor current_location) {
-        if (auto block = emitter.GetBasicBlock(current_location))
-            return block->entrypoint;
-
-        constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
-        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
-            // Immediately evacuate cache
-            invalidate_entire_cache = true;
-            PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
-        }
-        block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
-
-        // JIT Compile
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-        IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
-        Optimization::PolyfillPass(ir_block, polyfill_options);
-        Optimization::A64CallbackConfigPass(ir_block, conf);
-        Optimization::NamingPass(ir_block);
-        if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-            Optimization::A64GetSetElimination(ir_block);
-            Optimization::DeadCodeElimination(ir_block);
-        }
-        if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
-            Optimization::ConstantPropagation(ir_block);
-            Optimization::DeadCodeElimination(ir_block);
-        }
-        if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
-            Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
-        }
-        Optimization::IdentityRemovalPass(ir_block);
-        Optimization::VerificationPass(ir_block);
-        return emitter.Emit(ir_block).entrypoint;
-    }
+#include "dynarmic/backend/x64/a64_baseline_jit.inc"
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
@@ -301,12 +290,20 @@ private:
                 return;
             }
 
+            hot_samples.clear();
+            jit_state.baseline_hot_sample = 0;
+            jit_state.baseline_hot_countdown = 96;
             jit_state.ResetRSB();
             if (invalidate_entire_cache) {
+                ++cache_statistics.full_clears;
+                cache_statistics.full_cache_discarded_blocks += emitter.CachedBlockCount();
                 block_of_code.ClearCache();
                 emitter.ClearCache();
             } else {
+                ++cache_statistics.range_invalidation_batches;
+                const auto before = emitter.CachedBlockCount();
                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
+                cache_statistics.range_invalidated_blocks += before - emitter.CachedBlockCount();
             }
             invalid_cache_ranges.clear();
             invalidate_entire_cache = false;
@@ -320,6 +317,7 @@ private:
     BlockOfCode block_of_code;
     A64EmitX64 emitter;
     Optimization::PolyfillOptions polyfill_options;
+    CacheStatistics cache_statistics{.available = true};
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
@@ -337,6 +335,10 @@ HaltReason Jit::Run() {
 
 HaltReason Jit::Step() {
     return impl->Step();
+}
+
+CacheStatistics Jit::GetCacheStatistics() const {
+    return impl->GetCacheStatistics();
 }
 
 void Jit::ClearCache() {

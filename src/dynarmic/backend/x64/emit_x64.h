@@ -84,6 +84,8 @@ public:
     /// Looks up an emitted host block in the cache.
     std::optional<BlockDescriptor> GetBasicBlock(IR::LocationDescriptor descriptor) const;
 
+    size_t CachedBlockCount() const { return block_descriptors.size(); }
+
     /// Empties the entire cache.
     virtual void ClearCache();
 

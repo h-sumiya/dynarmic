@@ -5,6 +5,14 @@
 
 #pragma once
 
+// A2E_SHARDED_EXCLUSIVE_MONITOR_V2
+#ifndef A2E_DYNARMIC_SHARDED_MONITOR
+#define A2E_DYNARMIC_SHARDED_MONITOR 1
+#endif
+#if A2E_DYNARMIC_SHARDED_MONITOR && (defined(__x86_64__) || defined(_M_X64))
+#include "dynarmic/interface/exclusive_monitor_sharded.h"
+#else
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -86,3 +94,5 @@ private:
 };
 
 }  // namespace Dynarmic
+
+#endif  // x64 sharded monitor / original native ARM monitor

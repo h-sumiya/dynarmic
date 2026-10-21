@@ -193,8 +193,10 @@ struct ExceptionHandler::Impl final {
             [](const std::function<FakeCall(u64)>& cb_, PCONTEXT ctx) {
                 FakeCall fc = cb_(ctx->Rip);
 
-                ctx->Rsp -= sizeof(u64);
-                *mcl::bit_cast<u64*>(ctx->Rsp) = fc.ret_rip;
+                if (fc.ret_rip) {
+                    ctx->Rsp -= sizeof(u64);
+                    *mcl::bit_cast<u64*>(ctx->Rsp) = fc.ret_rip;
+                }
                 ctx->Rip = fc.call_rip;
             });
         code.add(code.rsp, 8);

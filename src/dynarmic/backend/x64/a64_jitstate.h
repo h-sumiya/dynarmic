@@ -12,6 +12,8 @@
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 
+namespace Dynarmic::A64 { struct UserConfig; struct UserCallbacks; }
+
 namespace Dynarmic::Backend::X64 {
 
 class BlockOfCode;
@@ -67,6 +69,8 @@ struct A64JitState {
     u32 GetFpsr() const;
     void SetFpcr(u32 value);
     void SetFpsr(u32 value);
+
+#include "dynarmic/backend/x64/a64_baseline_state.inc"
 
     u64 GetUniqueHash() const noexcept {
         const u64 fpcr_u64 = static_cast<u64>(fpcr & A64::LocationDescriptor::fpcr_mask) << A64::LocationDescriptor::fpcr_shift;

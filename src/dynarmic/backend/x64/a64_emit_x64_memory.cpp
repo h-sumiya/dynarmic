@@ -407,6 +407,8 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
     }
 }
 
+#include "dynarmic/backend/x64/emit_exclusive_alignment_a64.inc"
+
 void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {
     if (!conf.check_halt_on_memory_access) {
         return;

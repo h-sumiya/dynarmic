@@ -111,6 +111,7 @@ protected:
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
+    void EmitExclusiveAlignmentCheck(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Reg64 vaddr, std::size_t bitsize);
     template<std::size_t bitsize, auto callback>
     void EmitMemoryRead(A32EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

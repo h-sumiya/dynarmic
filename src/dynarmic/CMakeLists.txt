@@ -330,6 +330,18 @@ if ("x86_64" IN_LIST ARCHITECTURE)
 
     if ("A64" IN_LIST DYNARMIC_FRONTENDS)
         target_architecture_specific_sources(dynarmic "x86_64"
+            backend/x64/a64_baseline_compiler.cpp
+            backend/x64/a64_baseline_compiler.h
+            backend/x64/a64_baseline_memory.cpp
+            backend/x64/a64_baseline_memory.h
+            backend/x64/a64_baseline_simd.cpp
+            backend/x64/a64_baseline_simd.h
+            backend/x64/a64_baseline_simd_extra.cpp
+            backend/x64/a64_baseline_simd_extra.h
+            backend/x64/a64_baseline_system.cpp
+            backend/x64/a64_baseline_system.h
+            backend/x64/a64_baseline_crypto.cpp
+            backend/x64/a64_baseline_crypto.h
             backend/x64/a64_emit_x64.cpp
             backend/x64/a64_emit_x64.h
             backend/x64/a64_emit_x64_memory.cpp
@@ -531,6 +543,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(dynarmic PRIVATE FMT_USE_WINDOWS_H=0)
 endif()
 target_compile_definitions(dynarmic PRIVATE FMT_USE_USER_DEFINED_LITERALS=1)
+target_compile_definitions(dynarmic PUBLIC
+    A2E_DYNARMIC_SHARDED_MONITOR=$<BOOL:${A2E_DYNARMIC_SHARDED_MONITOR}>
+    A2E_DYNARMIC_PAGE_RANGE_INDEX=$<BOOL:${A2E_DYNARMIC_PAGE_RANGE_INDEX}>
+    A2E_DYNARMIC_LINEAR_IDENTITIES=$<BOOL:${A2E_DYNARMIC_LINEAR_IDENTITIES}>)
 
 if (DYNARMIC_USE_PRECOMPILED_HEADERS)
     set(PRECOMPILED_HEADERS "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/ir/ir_emitter.h>")

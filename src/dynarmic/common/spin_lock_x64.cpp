@@ -1,3 +1,8 @@
+// A2E_SHARDED_EXCLUSIVE_DISPATCH_V2
+#include "dynarmic/interface/exclusive_monitor.h"
+#if A2E_DYNARMIC_SHARDED_MONITOR
+#include "dynarmic/common/spin_lock_x64_sharded.inc"
+#else
 /* This file is part of the dynarmic project.
  * Copyright (c) 2022 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -74,3 +79,5 @@ void SpinLock::Unlock() {
 }
 
 }  // namespace Dynarmic
+
+#endif

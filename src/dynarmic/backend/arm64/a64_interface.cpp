@@ -207,6 +207,10 @@ HaltReason Jit::Step() {
     return impl->Step();
 }
 
+CacheStatistics Jit::GetCacheStatistics() const {
+    return {};  // Cache instrumentation is implemented for the x64 backend.
+}
+
 void Jit::ClearCache() {
     impl->ClearCache();
 }

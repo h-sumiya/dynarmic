@@ -55,6 +55,8 @@ enum class Exception {
     /// Attempted to execute a code block at an address for which MemoryReadCode returned std::nullopt.
     /// (Intended to be used to emulate memory protection faults.)
     NoExecuteFault,
+    /// An exclusive memory instruction used a non-naturally-aligned address.
+    AlignmentFault,
 };
 
 /// These function pointers may be inserted into compiled code.

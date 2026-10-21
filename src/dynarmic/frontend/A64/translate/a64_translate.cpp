@@ -35,9 +35,9 @@ IR::Block Translate(LocationDescriptor descriptor, MemoryReadCodeFuncType memory
 
         visitor.ir.current_location = visitor.ir.current_location->AdvancePC(4);
         block.CycleCount()++;
-    } while (should_continue && !single_step);
+    } while (should_continue && !single_step && block.CycleCount() < 64);
 
-    if (single_step && should_continue) {
+    if (should_continue && (single_step || block.CycleCount() >= 64)) {
         visitor.ir.SetTerm(IR::Term::LinkBlock{*visitor.ir.current_location});
     }
 

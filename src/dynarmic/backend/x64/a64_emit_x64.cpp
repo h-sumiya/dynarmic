@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <utility>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <mcl/assert.hpp>
@@ -54,6 +56,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
+    GenBaselineReturn();
     code.PreludeComplete();
     ClearFastDispatchTable();
 
@@ -63,6 +66,8 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 }
 
 A64EmitX64::~A64EmitX64() = default;
+
+#include "dynarmic/backend/x64/a64_baseline_emit.inc"
 
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (conf.very_verbose_debugging_output) {
@@ -74,7 +79,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         code.DisableWriting();
     };
 
-    const std::vector<HostLoc> gpr_order = [this] {
+    std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
         if (conf.page_table) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
@@ -85,7 +90,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         return gprs;
     }();
 
-    RegAlloc reg_alloc{code, gpr_order, any_xmm};
+    RegAlloc reg_alloc{code, std::move(gpr_order), any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
 
     // Start emitting.
@@ -157,7 +162,14 @@ void A64EmitX64::ClearCache() {
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    EmitX64::InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+}
+
+void A64EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations) {
+    const auto before = CachedBlockCount();
+    block_ranges.RemoveLocations(locations);
+    EmitX64::InvalidateBasicBlocks(locations);
+    fastmem_invalidated_blocks += before - CachedBlockCount();
 }
 
 void A64EmitX64::ClearFastDispatchTable() {

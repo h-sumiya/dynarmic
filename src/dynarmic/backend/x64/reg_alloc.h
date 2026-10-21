@@ -8,6 +8,7 @@
 #include <array>
 #include <functional>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -155,12 +156,12 @@ private:
     std::vector<HostLoc> gpr_order;
     std::vector<HostLoc> xmm_order;
 
-    HostLoc SelectARegister(const std::vector<HostLoc>& desired_locations) const;
+    HostLoc SelectARegister(std::span<const HostLoc> desired_locations) const;
     std::optional<HostLoc> ValueLocation(const IR::Inst* value) const;
 
-    HostLoc UseImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc ScratchImpl(const std::vector<HostLoc>& desired_locations);
+    HostLoc UseImpl(IR::Value use_value, std::span<const HostLoc> desired_locations);
+    HostLoc UseScratchImpl(IR::Value use_value, std::span<const HostLoc> desired_locations);
+    HostLoc ScratchImpl(std::span<const HostLoc> desired_locations);
     void DefineValueImpl(IR::Inst* def_inst, HostLoc host_loc);
     void DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst);
 

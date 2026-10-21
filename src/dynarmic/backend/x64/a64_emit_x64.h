@@ -12,6 +12,7 @@
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/a64_baseline_compiler.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -46,15 +47,24 @@ public:
      * @note block is modified.
      */
     BlockDescriptor Emit(IR::Block& block);
+    BlockDescriptor EmitBaseline(A64::LocationDescriptor location, const A64BaselineBlock& block);
+    const void* GetBaselineReturn() const { return baseline_return; }
+    const void* GetBaselineHotReturn() const { return baseline_hot_return; }
+    BlockDescriptor PromoteBaseline(IR::Block& block, CodePtr baseline);
 
     void ClearCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+    // The fastmem fault path directly invalidates descriptors rather than a
+    // guest range. Keep its metadata and statistics synchronized as well.
+    void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations);
+    u64 FastmemInvalidatedBlockCount() const { return fastmem_invalidated_blocks; }
 
 protected:
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
     BlockRangeInformation<u64> block_ranges;
+    u64 fastmem_invalidated_blocks = 0;
 
     struct FastDispatchEntry {
         u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;
@@ -80,6 +90,9 @@ protected:
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     void GenTerminalHandlers();
+    void GenBaselineReturn();
+    const void* baseline_return = nullptr;
+    const void* baseline_hot_return = nullptr;
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
@@ -109,6 +122,7 @@ protected:
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
+    void EmitExclusiveAlignmentCheck(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Reg64 vaddr, std::size_t bitsize);
     template<std::size_t bitsize, auto callback>
     void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

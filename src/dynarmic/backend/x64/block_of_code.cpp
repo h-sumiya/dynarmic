@@ -272,13 +272,20 @@ size_t BlockOfCode::SpaceRemaining() const {
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #ifdef _WIN32
-    if (committed_size < size_ + codesize) {
-        committed_size = std::min<size_t>(maxSize_, committed_size + codesize);
+    if (size_ > maxSize_)
+        throw Xbyak::Error(Xbyak::ERR_CODE_IS_TOO_BIG);
+    const size_t required = size_ + std::min(codesize, maxSize_ - size_);
+    if (committed_size < required) {
+        constexpr size_t commit_granularity = 64 * 1024;
+        const size_t desired = std::min(maxSize_, (required + commit_granularity - 1) & ~(commit_granularity - 1));
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_READWRITE);
+        void* result = VirtualAlloc(top_ + committed_size, desired - committed_size, MEM_COMMIT, PAGE_READWRITE);
 #    else
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        void* result = VirtualAlloc(top_ + committed_size, desired - committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 #    endif
+        if (result == nullptr)
+            throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
+        committed_size = desired;
     }
 #endif
 }
