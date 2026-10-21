@@ -13,7 +13,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         EmitExclusiveAlignmentCheck(ctx, inst, code.ABI_PARAM2, bitsize);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
         if (ordered) {
             code.mfence();
         }
@@ -32,7 +32,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         EmitExclusiveAlignmentCheck(ctx, inst, code.ABI_PARAM2, bitsize);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
         ctx.reg_alloc.AllocStackSpace(16 + ABI_SHADOW_SPACE);
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
         if (ordered) {
@@ -55,7 +55,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.test(dword[r15 + offsetof(AxxJitState, halt_reason)], static_cast<u32>(HaltReason::MemoryAbort));
     code.jz(read_ok);
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(code.ABI_PARAM1, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)));
+    DYNARMIC_RUNTIME_RESERVATION(code.ABI_PARAM1);
     code.mov(qword[code.ABI_PARAM1 + offsetof(ExclusiveMonitor::Reservation, epoch)], 0);
     code.L(read_ok);
     EmitCheckMemoryAbort(ctx, inst);
@@ -83,7 +83,7 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.je(end);
-    code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+    DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
 
@@ -152,7 +152,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitExclusiveAlignmentCheck(ctx, inst, vaddr, bitsize);
     EmitExclusiveLock(code, conf, vaddr, tmp, tmp2.cvt32());
 
-    code.mov(tmp2, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)));
+    DYNARMIC_RUNTIME_RESERVATION(tmp2);
     code.mov(qword[tmp2 + offsetof(ExclusiveMonitor::Reservation, epoch)], 0);
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
 
@@ -165,7 +165,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        fastmem_patch_info.emplace(
+        DYNARMIC_FASTMEM_RECORD(
             mcl::bit_cast<u64>(location),
             FastmemPatchInfo{
                 mcl::bit_cast<u64>(code.getCurr()),
@@ -187,7 +187,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(tmp2, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)));
+    DYNARMIC_RUNTIME_RESERVATION(tmp2);
     EmitWriteMemoryMov<bitsize>(code, tmp2 + offsetof(ExclusiveMonitor::Reservation, value), value_idx, false);
     code.mov(qword[tmp2 + offsetof(ExclusiveMonitor::Reservation, address)], vaddr);
     code.mov(qword[tmp2 + offsetof(ExclusiveMonitor::Reservation, bytes)], bitsize / 8);
@@ -198,7 +198,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     code.jnz(read_fault);
     // Re-use tmp2 after saving the guest value, without clobbering that value.
     code.mov(tmp2, qword[tmp + offsetof(ExclusiveMonitor::Bucket, epoch)]);
-    code.mov(reservation, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)));
+    DYNARMIC_RUNTIME_RESERVATION(reservation);
     code.mov(qword[reservation + offsetof(ExclusiveMonitor::Reservation, epoch)], tmp2);
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
     code.L(read_fault);
@@ -247,7 +247,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     EmitExclusiveLock(code, conf, vaddr, tmp, eax);
 
     SharedLabel end = GenSharedLabel();
-    code.mov(reservation, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)));
+    DYNARMIC_RUNTIME_RESERVATION(reservation);
     code.mov(status, u32(1));
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
@@ -322,7 +322,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
+            DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),

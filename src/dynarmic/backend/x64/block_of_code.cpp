@@ -20,6 +20,7 @@
 
 #include <array>
 #include <cstring>
+#include <stdexcept>
 
 #include <mcl/assert.hpp>
 #include <mcl/bit/bit_field.hpp>
@@ -116,20 +117,31 @@ public:
 // This is threadsafe as Xbyak::Allocator does not contain any state; it is a pure interface.
 CustomXbyakAllocator s_allocator;
 
-#ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 void ProtectMemory(const void* base, size_t size, bool is_executable) {
+    if (size == 0)
+        return;
 #    ifdef _WIN32
     DWORD oldProtect = 0;
-    VirtualProtect(const_cast<void*>(base), size, is_executable ? PAGE_EXECUTE_READ : PAGE_READWRITE, &oldProtect);
+    if (!VirtualProtect(const_cast<void*>(base), size, is_executable ? PAGE_EXECUTE_READ : PAGE_READWRITE, &oldProtect))
+        throw std::runtime_error("Dynarmic: VirtualProtect failed");
 #    else
     static const size_t pageSize = sysconf(_SC_PAGESIZE);
     const size_t iaddr = reinterpret_cast<size_t>(base);
     const size_t roundAddr = iaddr & ~(pageSize - static_cast<size_t>(1));
     const int mode = is_executable ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE);
-    mprotect(reinterpret_cast<void*>(roundAddr), size + (iaddr - roundAddr), mode);
+    if (mprotect(reinterpret_cast<void*>(roundAddr), size + (iaddr - roundAddr), mode) != 0)
+        throw std::runtime_error("Dynarmic: mprotect failed");
 #    endif
 }
+
+size_t CodePageSize() {
+#ifdef _WIN32
+    static const size_t page_size = [] { SYSTEM_INFO info; GetSystemInfo(&info); return static_cast<size_t>(info.dwPageSize); }();
+#else
+    static const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
 #endif
+    return page_size;
+}
 
 HostFeature GetHostFeatures() {
     HostFeature features = {};
@@ -219,18 +231,33 @@ bool IsUnderRosetta() {
 
 }  // anonymous namespace
 
-BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp)
+BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, bool concurrent_append_)
         : Xbyak::CodeGenerator(total_code_size, nullptr, &s_allocator)
         , cb(std::move(cb))
         , jsi(jsi)
-        , constant_pool(*this, CONSTANT_POOL_SIZE)
+        , concurrent_append(concurrent_append_)
+        , constant_pool(*this, concurrent_append_ ? 256 * 1024 : CONSTANT_POOL_SIZE)
         , host_features(GetHostFeatures()) {
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
+    if (concurrent_append) {
+        // Separate mutable constants from the first executable page even when
+        // the traditional backend was built without strict W^X support.
+#ifdef _WIN32
+        ProtectMemory(getCode(), committed_size, false);
+#else
+        ProtectMemory(getCode(), maxSize_, false);
+#endif
+        align(CodePageSize());
+        executable_begin = getSize();
+        sealed_size = executable_begin;
+    }
     GenRunCode(rcp);
 }
 
 void BlockOfCode::PreludeComplete() {
+    if (concurrent_append)
+        align(CodePageSize());
     prelude_complete = true;
     code_begin = getCurr();
     ClearCache();
@@ -238,6 +265,10 @@ void BlockOfCode::PreludeComplete() {
 }
 
 void BlockOfCode::EnableWriting() {
+    if (concurrent_append) {
+        ASSERT(getSize() >= sealed_size);
+        return;
+    }
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, false);
@@ -248,6 +279,18 @@ void BlockOfCode::EnableWriting() {
 }
 
 void BlockOfCode::DisableWriting() {
+    if (concurrent_append) {
+        EnsureMemoryCommitted(CodePageSize());
+        align(CodePageSize());
+        const size_t end = getSize();
+        ASSERT(end >= sealed_size);
+        ProtectMemory(getCode() + sealed_size, end - sealed_size, true);
+#ifdef _WIN32
+        FlushInstructionCache(GetCurrentProcess(), getCode() + sealed_size, end - sealed_size);
+#endif
+        sealed_size = end;
+        return;
+    }
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, true);
@@ -259,6 +302,7 @@ void BlockOfCode::DisableWriting() {
 
 void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
+    ASSERT(!concurrent_append || getCurr() == code_begin);
     SetCodePtr(code_begin);
 }
 
@@ -281,7 +325,8 @@ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         void* result = VirtualAlloc(top_ + committed_size, desired - committed_size, MEM_COMMIT, PAGE_READWRITE);
 #    else
-        void* result = VirtualAlloc(top_ + committed_size, desired - committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        void* result = VirtualAlloc(top_ + committed_size, desired - committed_size, MEM_COMMIT,
+                                    concurrent_append ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE);
 #    endif
         if (result == nullptr)
             throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);

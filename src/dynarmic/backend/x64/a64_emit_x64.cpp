@@ -5,6 +5,7 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <algorithm>
 #include <utility>
 
 #include <fmt/format.h>
@@ -51,21 +52,87 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
 }
 
-A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface,
+                     bool shared_optimized)
+        : EmitX64(code), shared_optimized(shared_optimized), conf(conf), jit_interface{jit_interface}
+        , fast_dispatch_table(shared_optimized ? nullptr : std::make_unique<FastDispatchEntry[]>(fast_dispatch_table_size))
+        , shared_fastmem_buckets(shared_optimized ? std::make_unique<std::atomic<const SharedFastmemRecord*>[]>(shared_fastmem_bucket_count) : nullptr) {
     GenMemory128Accessors();
     GenFastmemFallbacks();
-    GenTerminalHandlers();
-    GenBaselineReturn();
-    code.PreludeComplete();
-    ClearFastDispatchTable();
-
+    if (!shared_optimized) {
+        GenTerminalHandlers();
+        GenBaselineReturn();
+    }
+    // Windows stores its exception callback selector in the generated unwind
+    // data. Install it before a concurrent region seals the prelude read-only.
     exception_handler.SetFastmemCallback([this](u64 rip_) {
         return FastmemCallback(rip_);
     });
+    code.PreludeComplete();
+    ClearFastDispatchTable();
 }
 
 A64EmitX64::~A64EmitX64() = default;
+
+void A64EmitX64::EmitSharedDispatch() {
+    // The destination is the executing thread's permanent prelude. No return
+    // address in a reclaimable shared region is left on the native stack.
+    code.jmp(code.qword[code.r15 + offsetof(A64JitState, shared_dispatch)]);
+}
+
+void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
+                               IR::LocationDescriptor initial_location, bool is_single_step) {
+    code.mov(rax, A64::LocationDescriptor{next}.PC());
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    if (next == initial_location && !is_single_step) {
+        // This edge stays inside this immutable block. It needs neither a
+        // dispatch-index lookup nor a patchable cross-region code pointer.
+        // Invalidation/retirement must still force a permanent-prelude
+        // safepoint even when a guest spends its whole Run in a tight loop.
+        Xbyak::Label dispatch;
+        code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(dispatch, code.T_NEAR);
+        if (conf.enable_cycle_counting) {
+            code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+            code.jle(dispatch, code.T_NEAR);
+        }
+        code.mov(rax, qword[r15 + offsetof(A64JitState, shared_generation)]);
+        code.mov(rax, qword[rax]);
+        code.cmp(rax, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
+        code.jne(dispatch, code.T_NEAR);
+        ASSERT(shared_block_entrypoint);
+        code.jmp(shared_block_entrypoint);
+        code.L(dispatch);
+    }
+    EmitSharedDispatch();
+}
+
+void A64EmitX64::RegisterFastmemPatch(u64 rip, FastmemPatchInfo info) {
+    if (!shared_optimized) {
+        fastmem_patch_info.emplace(rip, std::move(info));
+        return;
+    }
+    info.recompile = false;
+    const size_t bucket = ((rip >> 4) ^ (rip >> 16)) & (shared_fastmem_bucket_count - 1);
+    auto& head = shared_fastmem_buckets[bucket];
+    auto node = std::make_unique<SharedFastmemRecord>(SharedFastmemRecord{
+        rip, std::move(info), head.load(std::memory_order_relaxed)});
+    const auto* published = node.get();
+    shared_fastmem_records.push_back(std::move(node));
+    head.store(published, std::memory_order_release);
+}
+
+FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
+    const size_t bucket = ((rip >> 4) ^ (rip >> 16)) & (shared_fastmem_bucket_count - 1);
+    for (const auto* node = shared_fastmem_buckets[bucket].load(std::memory_order_acquire);
+         node; node = node->next) {
+        if (node->rip == rip) {
+            return FakeCall{.call_rip = node->info.callback, .ret_rip = node->info.resume_rip};
+        }
+    }
+    ASSERT_FALSE("Fault in shared JIT code is not a registered fastmem access: {:016x}", rip);
+    return {};
+}
 
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
 
@@ -76,7 +143,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     code.EnableWriting();
     SCOPE_EXIT {
-        code.DisableWriting();
+        if (!shared_optimized)
+            code.DisableWriting();
     };
 
     std::vector<HostLoc> gpr_order = [this] {
@@ -96,6 +164,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     // Start emitting.
     code.align();
     const u8* const entrypoint = code.getCurr();
+    if (shared_optimized)
+        shared_block_entrypoint = entrypoint;
 
     ASSERT(block.GetCondition() == IR::Cond::AL);
 
@@ -146,6 +216,14 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
 
     const A64::LocationDescriptor descriptor{block.Location()};
+    if (shared_optimized) {
+        // The shared cache owns immutable descriptors, invalidation and
+        // publication. Do not install patchable private-cache bookkeeping;
+        // the same location can be emitted again after a guest invalidation.
+        // The worker seals the complete batch before publishing its entries.
+        PerfMapRegister(entrypoint, entrypoint + size, LocationDescriptorToFriendlyName(descriptor));
+        return BlockDescriptor{entrypoint, size};
+    }
     const A64::LocationDescriptor end_location{block.EndLocation()};
 
     const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
@@ -155,41 +233,30 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 }
 
 void A64EmitX64::ClearCache() {
+    ASSERT(!shared_optimized);  // Published shared code is retired as a region.
     EmitX64::ClearCache();
     block_ranges.ClearCache();
     ClearFastDispatchTable();
-    ClearInlineDispatchCaches();
-    next_inline_dispatch_cache = 0;
     fastmem_patch_info.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+    ASSERT(!shared_optimized);
     EmitX64::InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }
 
 void A64EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations) {
+    ASSERT(!shared_optimized);
     const auto before = CachedBlockCount();
     block_ranges.RemoveLocations(locations);
     EmitX64::InvalidateBasicBlocks(locations);
     fastmem_invalidated_blocks += before - CachedBlockCount();
 }
 
-void A64EmitX64::ClearInlineDispatchCaches() {
-    if (!inline_dispatch_caches_dirty) {
-        return;
-    }
-    for (auto& cache : inline_dispatch_caches) {
-        // A target invalidation drops cached pointers, but keeps a source
-        // site's miss budget and any installed global-dispatch jump. A newly
-        // translated source (including after ClearCache) gets a fresh budget.
-        cache.entries.fill({});
-    }
-    inline_dispatch_caches_dirty = false;
-}
 
 void A64EmitX64::ClearFastDispatchTable() {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        fast_dispatch_table.fill({});
+    if (fast_dispatch_table && conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        std::fill_n(fast_dispatch_table.get(), fast_dispatch_table_size, FastDispatchEntry{});
     }
 }
 
@@ -231,7 +298,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
-        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
+        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.get()));
         code.mov(rbp, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(rbp, r12);
@@ -242,15 +309,19 @@ void A64EmitX64::GenTerminalHandlers() {
         code.jne(fast_dispatch_cache_miss);
         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
-        code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
         code.LookupBlock();
+        Xbyak::Label skip_private_fill;
+        code.cmp(byte[r15 + offsetof(A64JitState, last_lookup_is_shared)], 0);
+        code.jne(skip_private_fill, code.T_SHORT);
+        code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
         code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
+        code.L(skip_private_fill);
         code.jmp(rax);
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
 
         code.align();
         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table.data()));
+        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table.get()));
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }
@@ -259,101 +330,12 @@ void A64EmitX64::GenTerminalHandlers() {
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
 
-        if (conf.inline_dispatch_cache) {
-            code.align();
-            terminal_handler_inline_dispatch_miss = code.getCurr<const void*>();
-            // r12 is the per-site cache, rbx is the full runtime descriptor.
-            // All three survive LookupBlock under both the Windows and SysV
-            // ABIs. This helper lives in the permanent prelude: LookupBlock may
-            // clear the code cache, so never return to the original branch site.
-            Xbyak::Label table_hit, fill_site;
-            Xbyak::Label lookup;
-            code.sub(dword[r12 + offsetof(InlineDispatchCache, misses_remaining)], 1);
-            code.jnz(lookup);
-            code.SwitchMxcsrOnExit();
-            code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(this));
-            code.mov(code.ABI_PARAM2, r12);
-            code.CallLambda([](A64EmitX64* self, InlineDispatchCache* cache) {
-                auto& code = self->code;
-                const auto cursor = code.getCurr();
-                code.EnableWriting();
-                SCOPE_EXIT {
-                    code.SetCodePtr(cursor);
-                    code.DisableWriting();
-                };
-                code.SetCodePtr(cache->site_begin);
-                code.jmp(self->terminal_handler_fast_dispatch_hint, code.T_NEAR);
-            });
-            code.SwitchMxcsrOnEntry();
-            // Patch BEFORE LookupBlock: it can roll over the code cache and
-            // reuse this cache object for another source site. The helper's
-            // RBX/R12 survive the native call under both supported host ABIs.
-            // Future executions use the original global dispatch with no PIC
-            // guards or counter updates; this miss completes in the prelude.
-            code.L(lookup);
-            code.mov(rax, reinterpret_cast<u64>(fast_dispatch_table.data()));
-            code.mov(rbp, rbx);
-            if (code.HasHostFeature(HostFeature::SSE42)) {
-                code.crc32(rbp, rax);
-            }
-            code.and_(ebp, fast_dispatch_table_mask);
-            code.lea(rbp, ptr[rax + rbp]);
-            code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
-            code.je(table_hit);
-            code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
-            code.LookupBlock();
-            code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
-            code.jmp(fill_site);
-            code.L(table_hit);
-            code.mov(rax, ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
-            code.L(fill_site);
-            // A first Unpatch clears every site once. Further Unpatch calls in
-            // the same batch stay O(1); a later runtime fill makes them dirty.
-            code.mov(rcx, reinterpret_cast<u64>(&inline_dispatch_caches_dirty));
-            code.mov(byte[rcx], 1);
-            code.mov(rcx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
-            code.mov(rdx, ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
-            code.mov(qword[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, location_descriptor)], rcx);
-            code.mov(ptr[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, code_ptr)], rdx);
-            code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
-            code.mov(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)], rax);
-            code.jmp(rax);
-            PerfMapRegister(terminal_handler_inline_dispatch_miss, code.getCurr(), "a64_inline_dispatch_miss");
-        }
     }
 }
 
-void A64EmitX64::EmitInlineDispatch() {
-    if (next_inline_dispatch_cache == inline_dispatch_caches.size()) {
-        inline_dispatch_caches.emplace_back();
-    }
-    auto& cache = inline_dispatch_caches[next_inline_dispatch_cache++];
-    cache = {};
-    cache.site_begin = code.getCurr();
-
-    // Match A64JitState::GetUniqueHash, including a changed FPCR. MSR FPCR uses
-    // FastDispatchHint too, so the source block's compile-time FPCR is not valid.
-    code.mov(rbp, qword[r15 + offsetof(A64JitState, pc)]);
-    code.mov(rcx, A64::LocationDescriptor::pc_mask);
-    code.and_(rcx, rbp);
-    code.mov(ebx, dword[r15 + offsetof(A64JitState, fpcr)]);
-    code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
-    code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
-    code.or_(rbx, rcx);
-
-    Xbyak::Label second;
-    code.mov(r12, reinterpret_cast<u64>(&cache));
-    code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
-    code.jne(second, code.T_SHORT);
-    code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
-    code.L(second);
-    code.cmp(rbx, qword[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, location_descriptor)]);
-    code.jne(terminal_handler_inline_dispatch_miss);
-    code.jmp(ptr[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, code_ptr)]);
-}
 
 void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
-    if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+    if (shared_optimized || !conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
         return;
     }
 
@@ -599,7 +581,7 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
-    Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    GetUserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
@@ -612,7 +594,7 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
     const u64 pc = args[0].GetImmediateU64();
     const u64 exception = args[1].GetImmediateU64();
-    Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    GetUserCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], pc);
         code.mov(param[1], exception);
     });
@@ -621,13 +603,13 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
-    Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    GetUserCallback<&A64::UserCallbacks::DataCacheOperationRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[0], args[1]);
-    Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    GetUserCallback<&A64::UserCallbacks::InstructionCacheOperationRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
@@ -645,7 +627,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
     }
 
     ctx.reg_alloc.HostCall(nullptr);
-    Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks).EmitCall(code);
+    GetUserCallback<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
@@ -659,7 +641,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();
     }
-    Devirtualize<&A64::UserCallbacks::GetCNTPCT>(conf.callbacks).EmitCall(code);
+    GetUserCallback<&A64::UserCallbacks::GetCNTPCT>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCTR(A64EmitContext& ctx, IR::Inst* inst) {
@@ -676,7 +658,14 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (shared_optimized) {
+        Xbyak::Label absent;
+        code.mov(result, qword[r15 + offsetof(A64JitState, runtime_tpidr_el0)]);
+        code.test(result, result);
+        code.jz(absent, code.T_SHORT);
+        code.mov(result, qword[result]);
+        code.L(absent);
+    } else if (conf.tpidr_el0) {
         code.mov(result, u64(conf.tpidr_el0));
         code.mov(result, qword[result]);
     } else {
@@ -687,7 +676,14 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidrro_el0) {
+    if (shared_optimized) {
+        Xbyak::Label absent;
+        code.mov(result, qword[r15 + offsetof(A64JitState, runtime_tpidrro_el0)]);
+        code.test(result, result);
+        code.jz(absent, code.T_SHORT);
+        code.mov(result, qword[result]);
+        code.L(absent);
+    } else if (conf.tpidrro_el0) {
         code.mov(result, u64(conf.tpidrro_el0));
         code.mov(result, qword[result]);
     } else {
@@ -700,7 +696,14 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(args[0]);
     const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (shared_optimized) {
+        Xbyak::Label absent;
+        code.mov(addr, qword[r15 + offsetof(A64JitState, runtime_tpidr_el0)]);
+        code.test(addr, addr);
+        code.jz(absent, code.T_SHORT);
+        code.mov(qword[addr], value);
+        code.L(absent);
+    } else if (conf.tpidr_el0) {
         code.mov(addr, u64(conf.tpidr_el0));
         code.mov(qword[addr], value);
     }
@@ -715,19 +718,32 @@ std::string A64EmitX64::LocationDescriptorToFriendlyName(const IR::LocationDescr
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
     code.SwitchMxcsrOnExit();
-    Devirtualize<&A64::UserCallbacks::InterpreterFallback>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    GetUserCallback<&A64::UserCallbacks::InterpreterFallback>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], param[0]);
         code.mov(param[1].cvt32(), terminal.num_instructions);
     });
-    code.ReturnFromRunCode(true);  // TODO: Check cycles
+    if (shared_optimized) {
+        code.SwitchMxcsrOnEntry();
+        EmitSharedDispatch();
+    } else {
+        code.ReturnFromRunCode(true);  // TODO: Check cycles
+    }
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {
-    code.ReturnFromRunCode();
+    if (shared_optimized) {
+        EmitSharedDispatch();
+    } else {
+        code.ReturnFromRunCode();
+    }
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (shared_optimized) {
+        EmitSharedLink(terminal.next, initial_location, is_single_step);
+        return;
+    }
     if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
@@ -760,7 +776,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     code.ForceReturnFromRunCode();
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (shared_optimized) {
+        EmitSharedLink(terminal.next, initial_location, is_single_step);
+        return;
+    }
     if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
@@ -777,6 +797,10 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+    if (shared_optimized) {
+        EmitSharedDispatch();
+        return;
+    }
     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
         code.ReturnFromRunCode();
         return;
@@ -786,16 +810,16 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, 
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+    if (shared_optimized) {
+        EmitSharedDispatch();
+        return;
+    }
     if (!conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
         code.ReturnFromRunCode();
         return;
     }
 
-    if (conf.inline_dispatch_cache) {
-        EmitInlineDispatch();
-    } else {
-        code.jmp(terminal_handler_fast_dispatch_hint);
-    }
+    code.jmp(terminal_handler_fast_dispatch_hint);
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
@@ -876,7 +900,6 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
 void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
     // Covers both range invalidation and fastmem fault-driven recompilation.
-    ClearInlineDispatchCaches();
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.DisableWriting();
         (*fast_dispatch_table_lookup)(location.Value()) = {};

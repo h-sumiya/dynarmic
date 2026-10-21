@@ -442,9 +442,13 @@ private:
 #ifdef _WIN32
         mov(rcx, r15);
         mov(edx, instruction);
+        if (helper_offset == offsetof(A64JitState, baseline_system_instruction))
+            lea(r8, ptr[rsp + ABI_SHADOW_SPACE]);
 #else
         mov(rdi, r15);
         mov(esi, instruction);
+        if (helper_offset == offsetof(A64JitState, baseline_system_instruction))
+            lea(rdx, ptr[rsp + ABI_SHADOW_SPACE]);
 #endif
         call(ptr[r15 + helper_offset]);
         EnterGuest();

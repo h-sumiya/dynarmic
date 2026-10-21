@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <boost/icl/interval_set.hpp>
@@ -18,9 +19,11 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/a64_shared_code_cache.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/common/x64_disassemble.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
@@ -59,18 +62,31 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
     };
 }
 
+static UserConfig PrepareConfig(UserConfig conf) {
+    if (!conf.callbacks)
+        throw std::invalid_argument("A64 Jit requires callbacks");
+    if (conf.enable_baseline_hot_optimization && !conf.shared_code_cache)
+        conf.shared_code_cache = std::make_shared<SharedCodeCache>();
+    return conf;
+}
+
 struct Jit::Impl final {
 public:
-    Impl(Jit* jit, UserConfig conf)
-            : conf(conf)
+    Impl(Jit* jit, UserConfig config)
+            : conf(PrepareConfig(std::move(config)))
             , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf))
             , emitter(block_of_code, conf, jit)
             , polyfill_options(GenPolyfillOptions(block_of_code)) {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
+        if (conf.shared_code_cache && conf.enable_baseline_hot_optimization)
+            shared_reader = SharedCodeCacheAccess::Attach(*conf.shared_code_cache, conf);
         InitializeBaselineState();
     }
 
-    ~Impl() = default;
+    ~Impl() {
+        if (shared_reader)
+            SharedCodeCacheAccess::Detach(*conf.shared_code_cache, *shared_reader);
+    }
 
     HaltReason Run() {
         ASSERT(!is_executing);
@@ -79,20 +95,13 @@ public:
         is_executing = true;
         SCOPE_EXIT {
             this->is_executing = false;
+            if (shared_reader)
+                SharedCodeCacheAccess::Unpin(*shared_reader);
         };
 
         // TODO: Check code alignment
 
-        const CodePtr current_code_ptr = [this] {
-            // RSB optimization
-            const u32 new_rsb_ptr = (jit_state.rsb_ptr - 1) & A64JitState::RSBPtrMask;
-            if (jit_state.GetUniqueHash() == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
-                jit_state.rsb_ptr = new_rsb_ptr;
-                return reinterpret_cast<CodePtr>(jit_state.rsb_codeptrs[new_rsb_ptr]);
-            }
-
-            return GetCurrentBlock();
-        }();
+        const CodePtr current_code_ptr = GetCurrentBlock();
 
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
 
@@ -108,6 +117,8 @@ public:
         is_executing = true;
         SCOPE_EXIT {
             this->is_executing = false;
+            if (shared_reader)
+                SharedCodeCacheAccess::Unpin(*shared_reader);
         };
 
         const HaltReason hr = block_of_code.StepCode(&jit_state, GetCurrentSingleStep());
@@ -118,6 +129,8 @@ public:
     }
 
     void ClearCache() {
+        if (conf.shared_code_cache && !conf.shared_cache_invalidation_managed)
+            conf.shared_code_cache->Clear();
         std::unique_lock lock{invalidation_mutex};
         invalidate_entire_cache = true;
         HaltExecution(HaltReason::CacheInvalidation);
@@ -126,6 +139,8 @@ public:
     void InvalidateCacheRange(u64 start_address, size_t length) {
         if (length == 0)
             return;
+        if (conf.shared_code_cache && !conf.shared_cache_invalidation_managed)
+            conf.shared_code_cache->InvalidateRange(start_address, length);
         std::unique_lock lock{invalidation_mutex};
         const auto end_address = static_cast<u64>(start_address + length - 1);
         if (end_address >= start_address) {
@@ -248,9 +263,11 @@ public:
         auto result = cache_statistics;
         result.live_blocks = emitter.CachedBlockCount();
         result.fastmem_invalidated_blocks = emitter.FastmemInvalidatedBlockCount();
+        const auto usage = emitter.GetBaselineCacheUsage();
+        const auto prelude = reinterpret_cast<const u8*>(block_of_code.GetCodeBegin()) - block_of_code.getCode();
         result.cache_capacity_bytes = block_of_code.GetTotalCodeSize();
-        result.cache_used_bytes = result.cache_capacity_bytes - block_of_code.SpaceRemaining();
-        result.cache_high_water_bytes = std::max(result.cache_high_water_bytes, result.cache_used_bytes);
+        result.cache_used_bytes = prelude + usage.used_bytes;
+        result.cache_high_water_bytes = prelude + usage.high_water_bytes;
         return result;
     }
 
@@ -303,6 +320,7 @@ private:
                 cache_statistics.full_cache_discarded_blocks += emitter.CachedBlockCount();
                 block_of_code.ClearCache();
                 emitter.ClearCache();
+                emitter.ResetBaselineCache();
             } else {
                 ++cache_statistics.range_invalidation_batches;
                 const auto before = emitter.CachedBlockCount();
@@ -322,6 +340,7 @@ private:
     A64EmitX64 emitter;
     Optimization::PolyfillOptions polyfill_options;
     CacheStatistics cache_statistics{.available = true};
+    std::unique_ptr<SharedCacheReader> shared_reader;
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;

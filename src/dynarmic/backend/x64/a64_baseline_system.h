@@ -6,10 +6,11 @@
 
 namespace Dynarmic::Backend::X64 {
 struct A64JitState;
+struct StackLayout;
 
 bool BaselineSystemSupported(u32 instruction);
 bool BaselineSystemTerminal(u32 instruction);
-bool ExecuteBaselineSystem(A64JitState* state, u32 instruction);
+bool ExecuteBaselineSystem(A64JitState* state, u32 instruction, StackLayout* stack);
 bool ExecuteBaselineUndefined(A64JitState* state, u32 instruction);
 bool ExecuteBaselineNoExecute(A64JitState* state, u32 unused);
 }  // namespace Dynarmic::Backend::X64

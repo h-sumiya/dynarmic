@@ -11,7 +11,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(inst, {}, args[1]);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
         if (ordered) {
             code.mfence();
         }
@@ -29,7 +29,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(nullptr);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
         ctx.reg_alloc.AllocStackSpace(16 + ABI_SHADOW_SPACE);
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
         if (ordered) {
@@ -71,7 +71,7 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.je(end);
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+    DYNARMIC_RUNTIME_CONFIG(code.ABI_PARAM1);
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
 
@@ -112,6 +112,15 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    // The legacy monitor embeds a processor's reservation address. The shared
+    // variant uses the runtime config path instead; the sharded monitor keeps
+    // its fully inline fastmem implementation with a state-local reservation.
+    if (shared_optimized) {
+        EmitExclusiveReadMemory<bitsize, callback>(ctx, inst);
+        return;
+    }
+#endif
     ASSERT(conf.global_monitor && conf.fastmem_pointer);
     if (!exception_handler.SupportsFastmem()) {
         EmitExclusiveReadMemory<bitsize, callback>(ctx, inst);
@@ -151,7 +160,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        fastmem_patch_info.emplace(
+        DYNARMIC_FASTMEM_RECORD(
             mcl::bit_cast<u64>(location),
             FastmemPatchInfo{
                 mcl::bit_cast<u64>(code.getCurr()),
@@ -189,6 +198,15 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    // The legacy monitor embeds a processor's reservation address. The shared
+    // variant uses the runtime config path instead; the sharded monitor keeps
+    // its fully inline fastmem implementation with a state-local reservation.
+    if (shared_optimized) {
+        EmitExclusiveWriteMemory<bitsize, callback>(ctx, inst);
+        return;
+    }
+#endif
     ASSERT(conf.global_monitor && conf.fastmem_pointer);
     if (!exception_handler.SupportsFastmem()) {
         EmitExclusiveWriteMemory<bitsize, callback>(ctx, inst);
@@ -289,7 +307,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
+            DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),

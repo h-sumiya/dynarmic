@@ -355,8 +355,11 @@ void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial
 }
 
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    const auto found = patch_information.find(target_desc);
+    if (found == patch_information.end())
+        return;
     const CodePtr save_code_ptr = code.getCurr();
-    const PatchInformation& patch_info = patch_information[target_desc];
+    const PatchInformation& patch_info = found->second;
 
     for (CodePtr location : patch_info.jg) {
         code.SetCodePtr(location);

@@ -20,6 +20,8 @@ class ExclusiveMonitor;
 namespace Dynarmic {
 namespace A64 {
 
+class SharedCodeCache;
+
 using VAddr = std::uint64_t;
 
 using Vector = std::array<std::uint64_t, 2>;
@@ -152,14 +154,6 @@ struct UserConfig {
     /// - RSB optimizations
     /// This is intended to be used for debugging.
     OptimizationFlag optimizations = all_safe_optimizations;
-
-    /// Keep a two-entry target cache at each indirect branch on x86-64 hosts.
-    /// This trades generated code and a small amount of per-site data for fewer
-    /// dependent loads on repeated BR/BLR targets. Requires FastDispatch.
-    /// After 64 cumulative misses a site returns to global dispatch until its
-    /// source block is recompiled, bounding overhead on polymorphic branches.
-    /// Other backends ignore this option. The full PC/FPCR descriptor is checked.
-    bool inline_dispatch_cache = false;
 
     bool HasOptimization(OptimizationFlag f) const {
         if (!unsafe_optimizations) {
@@ -311,6 +305,19 @@ struct UserConfig {
     /// without this option; no instrumentation is emitted into guest blocks.
     bool enable_cache_statistics = false;
     bool enable_baseline_hot_optimization = true;
+
+    /// Thread-private baseline segments; the code_cache_size includes its
+    /// immutable prelude. Capacity pressure reuses one segment at a time.
+    size_t baseline_cache_segment_size = 1024 * 1024;
+
+    /// Process-local optimized arena. A null pointer creates a private async
+    /// cache when hot optimization is enabled. Share explicitly per address
+    /// space to avoid compiling the same block on different guest threads.
+    std::shared_ptr<SharedCodeCache> shared_code_cache = {};
+
+    /// Set when the embedding engine invalidates the shared cache once before
+    /// broadcasting each guest invalidation to its thread-private Jits.
+    bool shared_cache_invalidation_managed = false;
 
     /// Internal use only
     bool very_verbose_debugging_output = false;

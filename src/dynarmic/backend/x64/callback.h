@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <vector>
 
@@ -50,6 +51,16 @@ public:
     ArgCallback(Function fn, u64 arg)
             : fn(reinterpret_cast<void (*)()>(fn)), arg(arg) {}
 
+    /// Call a free-function thunk whose first explicit argument is loaded from
+    /// the current JIT state. Unlike a member-function callback, a free thunk
+    /// uses the ordinary hidden return-pointer ABI on Windows as well.
+    template<typename Function>
+    static ArgCallback FromRuntimeState(Function fn, std::size_t offset) {
+        ArgCallback result{fn, static_cast<u64>(offset)};
+        result.runtime_argument = true;
+        return result;
+    }
+
     using Callback::EmitCall;
 
     void EmitCall(BlockOfCode& code, std::function<void(RegList)> fn) const override;
@@ -58,6 +69,7 @@ public:
 private:
     void (*fn)();
     u64 arg;
+    bool runtime_argument = false;
 };
 
 }  // namespace Dynarmic::Backend::X64

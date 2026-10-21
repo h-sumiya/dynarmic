@@ -10,7 +10,7 @@
     void (*baseline_memory_write)(A64JitState*, u64, u64, u32) = nullptr;
     bool (*baseline_memory_instruction)(A64JitState*, u32) = nullptr;
     bool (*baseline_simd_instruction)(A64JitState*, u32) = nullptr;
-    bool (*baseline_system_instruction)(A64JitState*, u32) = nullptr;
+    bool (*baseline_system_instruction)(A64JitState*, u32, StackLayout*) = nullptr;
     bool (*baseline_crypto_instruction)(A64JitState*, u32) = nullptr;
     bool (*baseline_undefined_instruction)(A64JitState*, u32) = nullptr;
     bool (*baseline_no_execute)(A64JitState*, u32) = nullptr;

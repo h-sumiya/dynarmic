@@ -37,7 +37,7 @@ struct RunCodeCallbacks {
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
-    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
+    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, bool concurrent_append = false);
     BlockOfCode(const BlockOfCode&) = delete;
 
     /// Call when external emitters have finished emitting their preludes.
@@ -184,6 +184,12 @@ private:
 
     bool prelude_complete = false;
     CodePtr code_begin = nullptr;
+
+    // Shared regions append into fresh pages. Published pages never become
+    // writable again; the non-executable constant pool is append-only data.
+    const bool concurrent_append;
+    size_t executable_begin = 0;
+    size_t sealed_size = 0;
 
 #ifdef _WIN32
     size_t committed_size = 0;

@@ -27,6 +27,15 @@ endif()
 
 if (NOT TARGET Catch2::Catch2WithMain)
     if (DYNARMIC_TESTS)
+        if (UNIX)
+            # Fastmem intentionally faults and resumes through Dynarmic's
+            # process-wide signal handler. Catch2's per-test fatal handler
+            # would replace it after the first test and turn recoverable JIT
+            # faults into crashes. Configure Catch2 itself, not only our test
+            # translation units, so its compiled runner leaves signals alone.
+            set(CATCH_CONFIG_POSIX_SIGNALS OFF)
+            set(CATCH_CONFIG_NO_POSIX_SIGNALS ON)
+        endif()
         add_subdirectory(catch EXCLUDE_FROM_ALL)
     endif()
 endif()

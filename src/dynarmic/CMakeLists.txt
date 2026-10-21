@@ -255,6 +255,7 @@ if ("A64" IN_LIST DYNARMIC_FRONTENDS)
         frontend/A64/translate/impl/system_flag_manipulation.cpp
         interface/A64/a64.h
         interface/A64/config.h
+        interface/A64/shared_code_cache.h
         ir/opt/a64_callback_config_pass.cpp
         ir/opt/a64_get_set_elimination_pass.cpp
         ir/opt/a64_merge_interpret_blocks.cpp
@@ -346,6 +347,9 @@ if ("x86_64" IN_LIST ARCHITECTURE)
             backend/x64/a64_emit_x64.h
             backend/x64/a64_emit_x64_memory.cpp
             backend/x64/a64_interface.cpp
+            backend/x64/a64_shared_code_cache.cpp
+            backend/x64/a64_shared_code_cache.h
+            backend/x64/a64_runtime_callback.h
             backend/x64/a64_jitstate.cpp
             backend/x64/a64_jitstate.h
         )
@@ -518,6 +522,8 @@ set_target_properties(dynarmic PROPERTIES
     SOVERSION ${dynarmic_VERSION_MAJOR}.${dynarmic_VERSION_MINOR}
 )
 target_compile_options(dynarmic PRIVATE ${DYNARMIC_CXX_FLAGS})
+find_package(Threads REQUIRED)
+target_link_libraries(dynarmic PRIVATE Threads::Threads)
 target_link_libraries(dynarmic
     PRIVATE
         Boost::boost

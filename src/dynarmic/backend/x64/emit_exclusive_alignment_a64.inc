@@ -13,7 +13,7 @@ void A64EmitX64::EmitExclusiveAlignmentCheck(A64EmitContext& ctx, IR::Inst* inst
         // There is no monitor lock to release: this guard runs before lock.
         code.sub(rsp, 8);  // The ABI save helper expects entry after CALL.
         ABI_PushCallerSaveRegistersAndAdjustStack(code);
-        Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks).EmitCall(code, [&](RegList param) {
+        GetUserCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
             code.mov(param[0], current_location.PC());
             code.mov(param[1], static_cast<u64>(A64::Exception::AlignmentFault));
         });

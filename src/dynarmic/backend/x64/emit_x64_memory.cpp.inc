@@ -10,6 +10,18 @@
 #define AxxJitState CONCATENATE_TOKENS(Axx, JitState)
 #define AxxUserConfig Axx::UserConfig
 
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+#    define DYNARMIC_MEMORY_CALLBACK(member) GetUserCallback<member>()
+#    define DYNARMIC_FASTMEM_RECORD(...) RegisterFastmemPatch(__VA_ARGS__)
+#    define DYNARMIC_RUNTIME_CONFIG(target) EmitRuntimeConfigPointer(target)
+#    define DYNARMIC_RUNTIME_RESERVATION(target) EmitRuntimeReservationPointer(target)
+#else
+#    define DYNARMIC_MEMORY_CALLBACK(member) Devirtualize<member>(conf.callbacks)
+#    define DYNARMIC_FASTMEM_RECORD(...) fastmem_patch_info.emplace(__VA_ARGS__)
+#    define DYNARMIC_RUNTIME_CONFIG(target) code.mov(target, reinterpret_cast<u64>(&conf))
+#    define DYNARMIC_RUNTIME_RESERVATION(target) code.mov(target, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)))
+#endif
+
 namespace {
 using Vector = std::array<u64, 2>;
 }
@@ -27,6 +39,11 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    if (shared_optimized) {
+        return SharedFastmemCallback(rip_);
+    }
+#endif
     const auto iter = fastmem_patch_info.find(rip_);
 
     if (iter == fastmem_patch_info.end()) {
@@ -71,7 +88,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             if (ordered) {
                 code.mfence();
             }
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            DYNARMIC_MEMORY_CALLBACK(callback).EmitCall(code);
             code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
         }
         EmitCheckMemoryAbort(ctx, inst);
@@ -104,7 +121,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
+            DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),
@@ -154,7 +171,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.CallFunction(memory_write_128);
         } else {
             ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            DYNARMIC_MEMORY_CALLBACK(callback).EmitCall(code);
         }
         if (ordered) {
             code.mfence();
@@ -191,7 +208,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
+            DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),
@@ -224,3 +241,8 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 #undef AxxEmitContext
 #undef AxxJitState
 #undef AxxUserConfig
+
+#undef DYNARMIC_MEMORY_CALLBACK
+#undef DYNARMIC_FASTMEM_RECORD
+#undef DYNARMIC_RUNTIME_CONFIG
+#undef DYNARMIC_RUNTIME_RESERVATION

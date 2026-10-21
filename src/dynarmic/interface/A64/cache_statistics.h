@@ -14,13 +14,10 @@ namespace Dynarmic::A64 {
 struct CacheStatistics {
     bool available = false;
     std::uint64_t compiled_blocks = 0;
-    std::uint64_t optimized_blocks = 0;
     std::uint64_t hot_samples = 0;
     std::uint64_t baseline_nanoseconds = 0;
-    std::uint64_t hot_optimization_nanoseconds = 0;
     std::uint64_t emitted_bytes = 0;
-    std::uint64_t capacity_clears = 0;
-    std::uint64_t full_clears = 0;  // Includes capacity_clears.
+    std::uint64_t full_clears = 0;    // Explicit full invalidations only.
     std::uint64_t full_cache_discarded_blocks = 0;
     std::uint64_t range_invalidation_batches = 0;
     std::uint64_t range_invalidated_blocks = 0;
@@ -29,11 +26,19 @@ struct CacheStatistics {
     std::uint64_t optimization_nanoseconds = 0;
     std::uint64_t emission_nanoseconds = 0;
     std::uint64_t live_blocks = 0;
-    // Used includes the Jit prelude and invalidated code not reclaimed until a
-    // full clear. It measures the code allocator cursor, not resident RAM.
+    // Private bytes occupied by the permanent prelude and live segment spans,
+    // including invalidated code awaiting segment reuse. This is allocator
+    // occupancy, not resident RAM; shared regions have separate statistics.
     std::uint64_t cache_used_bytes = 0;
     std::uint64_t cache_capacity_bytes = 0;
     std::uint64_t cache_high_water_bytes = 0;
+    std::uint64_t baseline_reclaimed_blocks = 0;
+    std::uint64_t baseline_reclaimed_bytes = 0;
+    std::uint64_t baseline_reclaimed_segments = 0;
+    // Slow-path observations only. Native shared-index hits intentionally do
+    // not increment a contended shared counter.
+    std::uint64_t shared_cache_hits = 0;
+    std::uint64_t shared_cache_requests = 0;
 };
 
 }  // namespace Dynarmic::A64

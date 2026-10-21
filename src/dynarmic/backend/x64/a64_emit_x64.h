@@ -6,13 +6,17 @@
 #pragma once
 
 #include <array>
-#include <deque>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 #include "dynarmic/backend/block_range_information.h"
+#include "dynarmic/backend/x64/a64_baseline_cache.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/a64_runtime_callback.h"
 #include "dynarmic/backend/x64/a64_baseline_compiler.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -40,7 +44,8 @@ struct A64EmitContext final : public EmitContext {
 
 class A64EmitX64 final : public EmitX64 {
 public:
-    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface);
+    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface,
+               bool shared_optimized = false);
     ~A64EmitX64() override;
 
     /**
@@ -49,9 +54,13 @@ public:
      */
     BlockDescriptor Emit(IR::Block& block);
     BlockDescriptor EmitBaseline(A64::LocationDescriptor location, const A64BaselineBlock& block);
+    // Call from the immutable thread dispatcher before EmitBaseline. The
+    // returned retirements require the owner to reset its RSB and hot samples.
+    BaselineReclamation PrepareBaselineEmission(size_t body_size);
+    BaselineCacheUsage GetBaselineCacheUsage() const { return baseline_cache.Usage(); }
+    void ResetBaselineCache() { baseline_cache.Reset(); }
     const void* GetBaselineReturn() const { return baseline_return; }
     const void* GetBaselineHotReturn() const { return baseline_hot_return; }
-    BlockDescriptor PromoteBaseline(IR::Block& block, CodePtr baseline);
 
     void ClearCache() override;
 
@@ -62,6 +71,7 @@ public:
     u64 FastmemInvalidatedBlockCount() const { return fastmem_invalidated_blocks; }
 
 protected:
+    const bool shared_optimized;
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
     BlockRangeInformation<u64> block_ranges;
@@ -74,22 +84,10 @@ protected:
     static_assert(sizeof(FastDispatchEntry) == 0x10);
     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x100000;
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    // Shared emitters tail-dispatch through the executing thread's prelude and
+    // therefore need no private 16 MiB dispatch table of their own.
+    std::unique_ptr<FastDispatchEntry[]> fast_dispatch_table;
     void ClearFastDispatchTable();
-
-    // References remain valid across growth and code-cache rollover. A miss
-    // helper can still hold one while LookupBlock clears the translated code.
-    struct InlineDispatchCache {
-        std::array<FastDispatchEntry, 2> entries;
-        CodePtr site_begin = nullptr;
-        u32 misses_remaining = 64;
-    };
-    static_assert(offsetof(InlineDispatchCache, entries) == 0);
-    std::deque<InlineDispatchCache> inline_dispatch_caches;
-    size_t next_inline_dispatch_cache = 0;
-    bool inline_dispatch_caches_dirty = false;
-    void ClearInlineDispatchCaches();
-    void EmitInlineDispatch();
 
     void (*memory_read_128)();
     void (*memory_write_128)();
@@ -101,14 +99,17 @@ protected:
     std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
     void GenFastmemFallbacks();
 
-    const void* terminal_handler_pop_rsb_hint;
+    const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
-    const void* terminal_handler_inline_dispatch_miss = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     void GenTerminalHandlers();
     void GenBaselineReturn();
     const void* baseline_return = nullptr;
     const void* baseline_hot_return = nullptr;
+
+    // Only the owning execution thread reads or changes this arena metadata.
+    // Shared optimized emitters never allocate from it.
+    A64BaselineCodeCache baseline_cache;
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
@@ -135,6 +136,30 @@ protected:
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
+
+    // The compiler is the only writer. Signal/exception handlers traverse only
+    // immutable nodes, published with release/acquire and retained until the
+    // complete shared region is destroyed after its reader grace period.
+    struct SharedFastmemRecord {
+        u64 rip;
+        FastmemPatchInfo info;
+        const SharedFastmemRecord* next;
+    };
+    static constexpr size_t shared_fastmem_bucket_count = 4096;
+    std::unique_ptr<std::atomic<const SharedFastmemRecord*>[]> shared_fastmem_buckets;
+    std::vector<std::unique_ptr<SharedFastmemRecord>> shared_fastmem_records;
+    void RegisterFastmemPatch(u64 rip, FastmemPatchInfo info);
+    FakeCall SharedFastmemCallback(u64 rip) const;
+
+    template<auto callback>
+    ArgCallback GetUserCallback() const {
+        return MakeA64Callback<callback>(conf.callbacks, shared_optimized);
+    }
+    void EmitSharedDispatch();
+    void EmitSharedLink(IR::LocationDescriptor next, IR::LocationDescriptor initial_location, bool is_single_step);
+    CodePtr shared_block_entrypoint = nullptr;
+    void EmitRuntimeConfigPointer(Xbyak::Reg64 target);
+    void EmitRuntimeReservationPointer(Xbyak::Reg64 target);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);

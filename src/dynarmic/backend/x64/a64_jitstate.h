@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 
 #include <mcl/stdint.hpp>
 
@@ -17,6 +18,7 @@ namespace Dynarmic::A64 { struct UserConfig; struct UserCallbacks; }
 namespace Dynarmic::Backend::X64 {
 
 class BlockOfCode;
+struct StackLayout;
 
 #ifdef _MSC_VER
 #    pragma warning(push)
@@ -71,6 +73,7 @@ struct A64JitState {
     void SetFpsr(u32 value);
 
 #include "dynarmic/backend/x64/a64_baseline_state.inc"
+#include "dynarmic/backend/x64/a64_shared_state.inc"
 
     u64 GetUniqueHash() const noexcept {
         const u64 fpcr_u64 = static_cast<u64>(fpcr & A64::LocationDescriptor::fpcr_mask) << A64::LocationDescriptor::fpcr_shift;

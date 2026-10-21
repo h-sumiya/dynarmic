@@ -26,7 +26,11 @@ Xbyak::Address ConstantPool::GetConstant(const Xbyak::AddressFrame& frame, u64 l
     const auto constant = ConstantT(lower, upper);
     auto iter = constant_info.find(constant);
     if (iter == constant_info.end()) {
-        ASSERT(insertion_point < pool.size());
+        // A shared region can fill its immutable constant pool before its
+        // instruction pages. Let the worker retire it and retry in a fresh
+        // region instead of terminating the process on normal capacity use.
+        if (insertion_point >= pool.size())
+            throw Xbyak::Error(Xbyak::ERR_CODE_IS_TOO_BIG);
         ConstantT& target_constant = pool[insertion_point];
         target_constant = constant;
         iter = constant_info.insert({constant, &target_constant}).first;

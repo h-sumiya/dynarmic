@@ -9,6 +9,7 @@
 #include <bit>
 
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -115,7 +116,7 @@ bool BaselineSystemTerminal(u32 instruction) {
            instruction == 0xd508751fu || instruction == 0xd508711fu;
 }
 
-bool ExecuteBaselineSystem(A64JitState* pointer, u32 instruction) {
+bool ExecuteBaselineSystem(A64JitState* pointer, u32 instruction, StackLayout* stack) {
     auto& state = *pointer;
     const auto& config = *state.runtime_config;
     auto& callbacks = *state.runtime_callbacks;
@@ -238,7 +239,20 @@ bool ExecuteBaselineSystem(A64JitState* pointer, u32 instruction) {
     case 0xd51b4420: state.SetFpsr(static_cast<u32>(Read(state, rd))); return true;
     case 0xd51b4200: state.SetPstate(static_cast<u32>(Read(state, rd))); return true;
     case 0xd53be000: Write(state, rd, config.cntfrq_el0); return true;
-    case 0xd53be020: case 0xd53be040: Write(state, rd, callbacks.GetCNTPCT()); return true;
+    case 0xd53be020: case 0xd53be040:
+        if (config.enable_cycle_counting && !config.wall_clock_cntpct) {
+            // The compiler splits before a cycle-based counter read. Commit
+            // prior blocks' pending ticks before observing the callback, then
+            // reset both counters so the run epilogue does not charge twice.
+            const auto consumed = static_cast<u64>(stack->cycles_to_run) -
+                                  static_cast<u64>(stack->cycles_remaining);
+            callbacks.AddTicks(consumed);
+            const auto remaining = static_cast<s64>(callbacks.GetTicksRemaining());
+            stack->cycles_to_run = remaining;
+            stack->cycles_remaining = remaining;
+        }
+        Write(state, rd, callbacks.GetCNTPCT());
+        return true;
     case 0xd53b0020: Write(state, rd, config.ctr_el0); return true;
     case 0xd53b00e0: Write(state, rd, config.dczid_el0); return true;
     case 0xd53bd040: Write(state, rd, state.runtime_tpidr_el0 ? *state.runtime_tpidr_el0 : 0); return true;
