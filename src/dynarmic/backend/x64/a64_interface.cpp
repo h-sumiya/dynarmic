@@ -46,7 +46,7 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
         if (conf.page_table) {
             code.mov(code.r14, mcl::bit_cast<u64>(conf.page_table));
         }
-        if (conf.fastmem_pointer) {
+        if (conf.fastmem_pointer && (*conf.fastmem_pointer != 0 || !conf.optimize_zero_base_fastmem)) {
             code.mov(code.r13, *conf.fastmem_pointer);
         }
     };
@@ -180,6 +180,10 @@ public:
     }
 
     std::array<u64, 31> GetRegisters() const {
+        return jit_state.reg;
+    }
+
+    std::span<const u64, 31> GetRegisterData() const {
         return jit_state.reg;
     }
 
@@ -387,6 +391,10 @@ void Jit::SetRegister(size_t index, u64 value) {
 
 std::array<u64, 31> Jit::GetRegisters() const {
     return impl->GetRegisters();
+}
+
+std::span<const u64, 31> Jit::GetRegisterData() const {
+    return impl->GetRegisterData();
 }
 
 void Jit::SetRegisters(const std::array<u64, 31>& value) {

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -76,6 +77,20 @@ protected:
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
     void ClearFastDispatchTable();
 
+    // References remain valid across growth and code-cache rollover. A miss
+    // helper can still hold one while LookupBlock clears the translated code.
+    struct InlineDispatchCache {
+        std::array<FastDispatchEntry, 2> entries;
+        CodePtr site_begin = nullptr;
+        u32 misses_remaining = 64;
+    };
+    static_assert(offsetof(InlineDispatchCache, entries) == 0);
+    std::deque<InlineDispatchCache> inline_dispatch_caches;
+    size_t next_inline_dispatch_cache = 0;
+    bool inline_dispatch_caches_dirty = false;
+    void ClearInlineDispatchCaches();
+    void EmitInlineDispatch();
+
     void (*memory_read_128)();
     void (*memory_write_128)();
     void (*memory_exclusive_write_128)();
@@ -88,6 +103,7 @@ protected:
 
     const void* terminal_handler_pop_rsb_hint;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
+    const void* terminal_handler_inline_dispatch_miss = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     void GenTerminalHandlers();
     void GenBaselineReturn();

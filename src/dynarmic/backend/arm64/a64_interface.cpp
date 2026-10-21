@@ -259,6 +259,10 @@ std::array<std::uint64_t, 31> Jit::GetRegisters() const {
     return impl->Regs();
 }
 
+std::span<const std::uint64_t, 31> Jit::GetRegisterData() const {
+    return impl->Regs();
+}
+
 void Jit::SetRegisters(const std::array<std::uint64_t, 31>& value) {
     impl->Regs() = value;
 }

@@ -65,19 +65,19 @@ Emitter::Result Emitter::MemoryInstruction(u32 instruction) {
         access_offsets[n] = static_cast<u32>(getSize());
         if (op.load) {
             switch (bytes) {
-            case 1: movzx(eax, byte[r13 + rbx + n * bytes]); movd(temporary, eax); break;
-            case 2: movzx(eax, word[r13 + rbx + n * bytes]); movd(temporary, eax); break;
-            case 4: movd(temporary, dword[r13 + rbx + n * bytes]); break;
-            case 8: movq(temporary, qword[r13 + rbx + n * bytes]); break;
-            case 16: movdqu(temporary, xword[r13 + rbx + n * bytes]); break;
+            case 1: movzx(eax, byte[FastmemAddress(n * bytes)]); movd(temporary, eax); break;
+            case 2: movzx(eax, word[FastmemAddress(n * bytes)]); movd(temporary, eax); break;
+            case 4: movd(temporary, dword[FastmemAddress(n * bytes)]); break;
+            case 8: movq(temporary, qword[FastmemAddress(n * bytes)]); break;
+            case 16: movdqu(temporary, xword[FastmemAddress(n * bytes)]); break;
             }
         } else {
             switch (bytes) {
-            case 1: mov(byte[r13 + rbx + n * bytes], al); break;
-            case 2: mov(word[r13 + rbx + n * bytes], ax); break;
-            case 4: movd(dword[r13 + rbx + n * bytes], temporary); break;
-            case 8: movq(qword[r13 + rbx + n * bytes], temporary); break;
-            case 16: movdqu(xword[r13 + rbx + n * bytes], temporary); break;
+            case 1: mov(byte[FastmemAddress(n * bytes)], al); break;
+            case 2: mov(word[FastmemAddress(n * bytes)], ax); break;
+            case 4: movd(dword[FastmemAddress(n * bytes)], temporary); break;
+            case 8: movq(qword[FastmemAddress(n * bytes)], temporary); break;
+            case 16: movdqu(xword[FastmemAddress(n * bytes)], temporary); break;
             }
         }
     }

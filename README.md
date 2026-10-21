@@ -3,7 +3,18 @@ Dynarmic
 
 [![Github Actions Build Status (x86-64)](https://github.com/MerryMage/dynarmic/actions/workflows/x86-64.yml/badge.svg)](https://github.com/MerryMage/dynarmic/actions/workflows/x86-64.yml) [![Github Actions Build Status (AArch64)](https://github.com/merryhime/dynarmic/actions/workflows/aarch64.yml/badge.svg)](https://github.com/MerryMage/dynarmic/actions/workflows/AArch64.yml)
 
-A dynamic recompiler for ARM.
+A dynamic recompiler for ARM, maintained for [apk2exe](https://github.com/h-sumiya/apk2exe).
+
+The x86-64 A64 backend contains an independent direct baseline compiler and
+sampled hot-block optimization on the owning execution thread. Each JIT owns
+its code cache and dispatch tables. The runtime includes bucketed exclusive
+reservations, a page-range invalidation index, compile statistics, zero-base
+fastmem and optional per-site indirect-branch caches. See
+[A64 execution](docs/A64-execution.md) for configuration and source layout.
+
+Source files retain their license notices. The baseline files marked MIT use
+[LICENSES/MIT-apk2exe.txt](LICENSES/MIT-apk2exe.txt); other Dynarmic sources use
+[LICENSE.txt](LICENSE.txt). External dependencies retain their own licenses.
 
 Highlight features:
 

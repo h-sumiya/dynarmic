@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,12 @@ public:
 
     /// Read all general-purpose registers.
     std::array<std::uint64_t, 31> GetRegisters() const;
+    /// Read the materialized general-purpose register bank without copying it.
+    /// The view remains valid until this Jit is destroyed. Access it only on the
+    /// owning execution thread, outside Run/Step or in a callback where guest
+    /// GPR state has been materialized (such as CallSVC). This view does not
+    /// synchronize registers; values change when execution resumes. No SP.
+    std::span<const std::uint64_t, 31> GetRegisterData() const;
     /// Modify all general-purpose registers.
     void SetRegisters(const std::array<std::uint64_t, 31>& value);
 

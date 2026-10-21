@@ -84,7 +84,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         if (conf.page_table) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
         }
-        if (conf.fastmem_pointer) {
+        if (conf.fastmem_pointer && (*conf.fastmem_pointer != 0 || !conf.optimize_zero_base_fastmem)) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
         }
         return gprs;
@@ -158,6 +158,8 @@ void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
     block_ranges.ClearCache();
     ClearFastDispatchTable();
+    ClearInlineDispatchCaches();
+    next_inline_dispatch_cache = 0;
     fastmem_patch_info.clear();
 }
 
@@ -170,6 +172,19 @@ void A64EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescript
     block_ranges.RemoveLocations(locations);
     EmitX64::InvalidateBasicBlocks(locations);
     fastmem_invalidated_blocks += before - CachedBlockCount();
+}
+
+void A64EmitX64::ClearInlineDispatchCaches() {
+    if (!inline_dispatch_caches_dirty) {
+        return;
+    }
+    for (auto& cache : inline_dispatch_caches) {
+        // A target invalidation drops cached pointers, but keeps a source
+        // site's miss budget and any installed global-dispatch jump. A newly
+        // translated source (including after ClearCache) gets a fresh budget.
+        cache.entries.fill({});
+    }
+    inline_dispatch_caches_dirty = false;
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
@@ -243,7 +258,98 @@ void A64EmitX64::GenTerminalHandlers() {
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+
+        if (conf.inline_dispatch_cache) {
+            code.align();
+            terminal_handler_inline_dispatch_miss = code.getCurr<const void*>();
+            // r12 is the per-site cache, rbx is the full runtime descriptor.
+            // All three survive LookupBlock under both the Windows and SysV
+            // ABIs. This helper lives in the permanent prelude: LookupBlock may
+            // clear the code cache, so never return to the original branch site.
+            Xbyak::Label table_hit, fill_site;
+            Xbyak::Label lookup;
+            code.sub(dword[r12 + offsetof(InlineDispatchCache, misses_remaining)], 1);
+            code.jnz(lookup);
+            code.SwitchMxcsrOnExit();
+            code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(this));
+            code.mov(code.ABI_PARAM2, r12);
+            code.CallLambda([](A64EmitX64* self, InlineDispatchCache* cache) {
+                auto& code = self->code;
+                const auto cursor = code.getCurr();
+                code.EnableWriting();
+                SCOPE_EXIT {
+                    code.SetCodePtr(cursor);
+                    code.DisableWriting();
+                };
+                code.SetCodePtr(cache->site_begin);
+                code.jmp(self->terminal_handler_fast_dispatch_hint, code.T_NEAR);
+            });
+            code.SwitchMxcsrOnEntry();
+            // Patch BEFORE LookupBlock: it can roll over the code cache and
+            // reuse this cache object for another source site. The helper's
+            // RBX/R12 survive the native call under both supported host ABIs.
+            // Future executions use the original global dispatch with no PIC
+            // guards or counter updates; this miss completes in the prelude.
+            code.L(lookup);
+            code.mov(rax, reinterpret_cast<u64>(fast_dispatch_table.data()));
+            code.mov(rbp, rbx);
+            if (code.HasHostFeature(HostFeature::SSE42)) {
+                code.crc32(rbp, rax);
+            }
+            code.and_(ebp, fast_dispatch_table_mask);
+            code.lea(rbp, ptr[rax + rbp]);
+            code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
+            code.je(table_hit);
+            code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+            code.LookupBlock();
+            code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
+            code.jmp(fill_site);
+            code.L(table_hit);
+            code.mov(rax, ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
+            code.L(fill_site);
+            // A first Unpatch clears every site once. Further Unpatch calls in
+            // the same batch stay O(1); a later runtime fill makes them dirty.
+            code.mov(rcx, reinterpret_cast<u64>(&inline_dispatch_caches_dirty));
+            code.mov(byte[rcx], 1);
+            code.mov(rcx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
+            code.mov(rdx, ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
+            code.mov(qword[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, location_descriptor)], rcx);
+            code.mov(ptr[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, code_ptr)], rdx);
+            code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+            code.mov(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)], rax);
+            code.jmp(rax);
+            PerfMapRegister(terminal_handler_inline_dispatch_miss, code.getCurr(), "a64_inline_dispatch_miss");
+        }
     }
+}
+
+void A64EmitX64::EmitInlineDispatch() {
+    if (next_inline_dispatch_cache == inline_dispatch_caches.size()) {
+        inline_dispatch_caches.emplace_back();
+    }
+    auto& cache = inline_dispatch_caches[next_inline_dispatch_cache++];
+    cache = {};
+    cache.site_begin = code.getCurr();
+
+    // Match A64JitState::GetUniqueHash, including a changed FPCR. MSR FPCR uses
+    // FastDispatchHint too, so the source block's compile-time FPCR is not valid.
+    code.mov(rbp, qword[r15 + offsetof(A64JitState, pc)]);
+    code.mov(rcx, A64::LocationDescriptor::pc_mask);
+    code.and_(rcx, rbp);
+    code.mov(ebx, dword[r15 + offsetof(A64JitState, fpcr)]);
+    code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+    code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+    code.or_(rbx, rcx);
+
+    Xbyak::Label second;
+    code.mov(r12, reinterpret_cast<u64>(&cache));
+    code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
+    code.jne(second, code.T_SHORT);
+    code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
+    code.L(second);
+    code.cmp(rbx, qword[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, location_descriptor)]);
+    code.jne(terminal_handler_inline_dispatch_miss);
+    code.jmp(ptr[r12 + sizeof(FastDispatchEntry) + offsetof(FastDispatchEntry, code_ptr)]);
 }
 
 void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
@@ -685,7 +791,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescri
         return;
     }
 
-    code.jmp(terminal_handler_fast_dispatch_hint);
+    if (conf.inline_dispatch_cache) {
+        EmitInlineDispatch();
+    } else {
+        code.jmp(terminal_handler_fast_dispatch_hint);
+    }
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
@@ -765,6 +875,8 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
 
 void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
+    // Covers both range invalidation and fastmem fault-driven recompilation.
+    ClearInlineDispatchCaches();
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.DisableWriting();
         (*fast_dispatch_table_lookup)(location.Value()) = {};

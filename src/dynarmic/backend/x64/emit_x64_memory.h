@@ -162,9 +162,18 @@ template<>
 template<>
 [[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
+    const auto with_base = [&ctx](Xbyak::Reg64 address) -> Xbyak::RegExp {
+        // A zero base is common for runtimes sharing native and guest pointers.
+        // Match the allocator and entry prelude: R13 is an ordinary temporary
+        // in this mode and must never be used as an implicit base register.
+        if (ctx.conf.optimize_zero_base_fastmem && ctx.conf.fastmem_pointer == uintptr_t{0}) {
+            return address;
+        }
+        return r13 + address;
+    };
 
     if (unused_top_bits == 0) {
-        return r13 + vaddr;
+        return with_base(vaddr);
     } else if (ctx.conf.silently_mirror_fastmem) {
         if (!tmp) {
             tmp = ctx.reg_alloc.ScratchGpr();
@@ -179,7 +188,7 @@ template<>
             code.mov(tmp->cvt32(), vaddr.cvt32());
             code.and_(*tmp, u32((1 << ctx.conf.fastmem_address_space_bits) - 1));
         }
-        return r13 + *tmp;
+        return with_base(*tmp);
     } else {
         if (ctx.conf.fastmem_address_space_bits < 32) {
             code.test(vaddr, u32(-(1 << ctx.conf.fastmem_address_space_bits)));
@@ -195,7 +204,7 @@ template<>
             code.jnz(abort, code.T_NEAR);
             require_abort_handling = true;
         }
-        return r13 + vaddr;
+        return with_base(vaddr);
     }
 }
 

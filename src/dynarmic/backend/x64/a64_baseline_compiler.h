@@ -52,10 +52,10 @@ struct A64BaselineBlock {
 /// guest MXCSR is active and state.pc names the block entry. Exit: pc names the
 /// next instruction or exact faulting instruction, and all architectural state
 /// is materialized. Edges use the thread's A64JitState::baseline_return;
-/// self-edges check halt and instruction budget before repeating. r13/r14
-/// retain the thread's fastmem/page-table bases.
-/// For 64-bit unmirrored fastmem, r13 supplies this execution's fastmem base;
-/// the caller must install the immutable fault records before executing code.
+/// self-edges check halt and instruction budget before repeating. r14 retains
+/// the thread's page-table base. For 64-bit unmirrored fastmem, r13 supplies the
+/// base unless optimize_zero_base_fastmem permits direct guest addresses.
+/// The caller must install the immutable fault records before executing code.
 std::optional<A64BaselineBlock> CompileA64Baseline(
     u64 pc, const BaselineReadCode& get_code,
     const A64::UserConfig& config, u32 max_instructions = 32,

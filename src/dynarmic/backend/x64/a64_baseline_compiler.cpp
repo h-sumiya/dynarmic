@@ -181,6 +181,12 @@ private:
                config.fastmem_address_space_bits == 64 && !config.silently_mirror_fastmem;
     }
 
+    Xbyak::RegExp FastmemAddress(s32 displacement = 0) const {
+        if (config.optimize_zero_base_fastmem && config.fastmem_pointer == uintptr_t{0})
+            return rbx + displacement;
+        return r13 + rbx + displacement;
+    }
+
     static std::size_t RegisterOffset(unsigned guest) {
         return guest == 31 ? offsetof(A64JitState, sp)
                            : offsetof(A64JitState, reg) + guest * sizeof(u64);
@@ -474,10 +480,10 @@ private:
         if (FastMemory()) {
             const auto fault = static_cast<u32>(getSize());
             switch (bytes) {
-            case 1: movzx(eax, byte[r13 + rbx]); break;
-            case 2: movzx(eax, word[r13 + rbx]); break;
-            case 4: mov(eax, dword[r13 + rbx]); break;
-            case 8: mov(rax, qword[r13 + rbx]); break;
+            case 1: movzx(eax, byte[FastmemAddress()]); break;
+            case 2: movzx(eax, word[FastmemAddress()]); break;
+            case 4: mov(eax, dword[FastmemAddress()]); break;
+            case 8: mov(rax, qword[FastmemAddress()]); break;
             }
             jmp(done, T_NEAR);
             faults[fault_count++] = {fault, static_cast<u32>(getSize())};
@@ -507,10 +513,10 @@ private:
         if (FastMemory()) {
             const auto fault = static_cast<u32>(getSize());
             switch (bytes) {
-            case 1: mov(byte[r13 + rbx], al); break;
-            case 2: mov(word[r13 + rbx], ax); break;
-            case 4: mov(dword[r13 + rbx], eax); break;
-            case 8: mov(qword[r13 + rbx], rax); break;
+            case 1: mov(byte[FastmemAddress()], al); break;
+            case 2: mov(word[FastmemAddress()], ax); break;
+            case 4: mov(dword[FastmemAddress()], eax); break;
+            case 8: mov(qword[FastmemAddress()], rax); break;
             }
             jmp(done, T_NEAR);
             faults[fault_count++] = {fault, static_cast<u32>(getSize())};

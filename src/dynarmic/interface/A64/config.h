@@ -153,6 +153,14 @@ struct UserConfig {
     /// This is intended to be used for debugging.
     OptimizationFlag optimizations = all_safe_optimizations;
 
+    /// Keep a two-entry target cache at each indirect branch on x86-64 hosts.
+    /// This trades generated code and a small amount of per-site data for fewer
+    /// dependent loads on repeated BR/BLR targets. Requires FastDispatch.
+    /// After 64 cumulative misses a site returns to global dispatch until its
+    /// source block is recompiled, bounding overhead on polymorphic branches.
+    /// Other backends ignore this option. The full PC/FPCR descriptor is checked.
+    bool inline_dispatch_cache = false;
+
     bool HasOptimization(OptimizationFlag f) const {
         if (!unsafe_optimizations) {
             f &= all_safe_optimizations;
@@ -246,6 +254,12 @@ struct UserConfig {
     /// be. If the host page faults on an address, the JIT will fallback to calling the
     /// MemoryRead*/MemoryWrite* callbacks.
     std::optional<uintptr_t> fastmem_pointer = std::nullopt;
+    /// On x64, omit the base register when fastmem_pointer is zero. Guest
+    /// addresses then already name host memory, so the base register is made
+    /// available to the register allocator. Bounds checks, address mirroring,
+    /// fault callbacks and exclusive access semantics remain unchanged.
+    /// Disable to compare against the base-register implementation.
+    bool optimize_zero_base_fastmem = true;
     /// Determines if instructions that pagefault should cause recompilation of that block
     /// with fastmem disabled.
     /// Recompiled code will use the page_table if this is available, otherwise memory
