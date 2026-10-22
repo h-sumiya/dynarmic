@@ -9,13 +9,14 @@
 
 #include "dynarmic/frontend/A64/a64_types.h"
 #include "dynarmic/ir/basic_block.h"
+#include "dynarmic/ir/ir_emitter.h"
 #include "dynarmic/ir/opcodes.h"
 #include "dynarmic/ir/opt/passes.h"
 #include "dynarmic/ir/value.h"
 
 namespace Dynarmic::Optimization {
 
-void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
+void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state, bool memory_callbacks_preserve_state) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -32,12 +33,14 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
         IR::Value register_value;
         TrackingType tracking_type;
         bool set_instruction_present = false;
+        bool known_zero_upper = false;
         Iterator last_set_instruction;
     };
     std::array<RegisterInfo, 31> reg_info;
     std::array<RegisterInfo, 32> vec_info;
     RegisterInfo sp_info;
     RegisterInfo nzcv_info;
+    IR::IREmitter ir{block};
 
     const auto do_set = [&block](RegisterInfo& info, IR::Value value, Iterator set_inst, TrackingType tracking_type) {
         if (info.set_instruction_present) {
@@ -48,10 +51,11 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
         info.register_value = value;
         info.tracking_type = tracking_type;
         info.set_instruction_present = true;
+        info.known_zero_upper = tracking_type == TrackingType::W;
         info.last_set_instruction = set_inst;
     };
 
-    const auto do_get = [](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
+    const auto do_get = [&ir](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
         const auto do_nothing = [&] {
             info = {};
             info.register_value = IR::Value(&*get_inst);
@@ -68,13 +72,28 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
             return;
         }
 
+        // Wn and Xn name the same architectural register. Keep its SSA value
+        // across mixed-width reads, including W writes which clear the upper
+        // half, so integer/address calculations need no state round trip.
+        if (info.tracking_type == TrackingType::W && tracking_type == TrackingType::X && info.known_zero_upper) {
+            ir.SetInsertionPointBefore(get_inst);
+            get_inst->ReplaceUsesWith(ir.ZeroExtendWordToLong(IR::U32{info.register_value}));
+            return;
+        }
+        if (info.tracking_type == TrackingType::X && tracking_type == TrackingType::W) {
+            ir.SetInsertionPointBefore(get_inst);
+            get_inst->ReplaceUsesWith(ir.LeastSignificantWord(IR::U64{info.register_value}));
+            return;
+        }
+
         do_nothing();
     };
 
     for (auto inst = block.begin(); inst != block.end(); ++inst) {
         // A memory callback may halt at this instruction. Keep every preceding
-        // architectural write visible in that case, but continue optimizing
-        // the independent arithmetic stretches on either side of the access.
+        // architectural write visible in that case. Register-preserving memory
+        // callbacks need no state reload on the normal continuation, so freeze
+        // prior stores without forgetting their SSA values or upper-bit facts.
         const auto opcode = inst->GetOpcode();
         const bool observer = inst->IsMemoryReadOrWrite() || inst->CausesCPUException() ||
             opcode == IR::Opcode::CallHostFunction || opcode == IR::Opcode::A64GetCNTPCT ||
@@ -82,10 +101,19 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state) {
             opcode == IR::Opcode::A64InstructionCacheOperationRaised ||
             opcode == IR::Opcode::A64InstructionSynchronizationBarrier;
         if (preserve_memory_fault_state && observer) {
-            reg_info = {};
-            vec_info = {};
-            sp_info = {};
-            nzcv_info = {};
+            if (inst->IsMemoryReadOrWrite() && memory_callbacks_preserve_state) {
+                for (auto& info : reg_info)
+                    info.set_instruction_present = false;
+                for (auto& info : vec_info)
+                    info.set_instruction_present = false;
+                sp_info.set_instruction_present = false;
+                nzcv_info.set_instruction_present = false;
+            } else {
+                reg_info = {};
+                vec_info = {};
+                sp_info = {};
+                nzcv_info = {};
+            }
         }
         switch (inst->GetOpcode()) {
         case IR::Opcode::A64GetW: {

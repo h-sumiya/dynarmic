@@ -293,6 +293,13 @@ struct UserConfig {
     /// for exit after every data memory access by the emulated program.
     bool check_halt_on_memory_access = false;
 
+    /// MemoryRead*, MemoryWrite* and MemoryWriteExclusive* callbacks preserve
+    /// architectural registers (GPR, SIMD, SP, NZCV, FPCR and FPSR). They may
+    /// halt execution and update memory or exclusive-monitor state. This lets
+    /// precise-fault optimization reuse register values across data accesses
+    /// while retaining the architectural stores visible to a fault handler.
+    bool memory_callbacks_preserve_state = false;
+
     /// This option allows you to disable cycle counting. If this is set to false,
     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
     bool enable_cycle_counting = true;

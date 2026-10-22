@@ -49,7 +49,7 @@ auto TranslationContract(const UserConfig& c) {
         c.fastmem_pointer, c.optimize_zero_base_fastmem,
         c.fastmem_address_space_bits, c.silently_mirror_fastmem,
         c.fastmem_exclusive_access, c.define_unpredictable_behaviour,
-        c.wall_clock_cntpct, c.check_halt_on_memory_access,
+        c.wall_clock_cntpct, c.check_halt_on_memory_access, c.memory_callbacks_preserve_state,
         c.enable_cycle_counting, c.very_verbose_debugging_output};
 }
 
@@ -452,7 +452,7 @@ struct SharedCodeCache::Impl {
             Optimization::A64CallbackConfigPass(ir, conf);
             Optimization::NamingPass(ir);
             if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
-                Optimization::A64GetSetElimination(ir, conf.check_halt_on_memory_access);
+                Optimization::A64GetSetElimination(ir, conf.check_halt_on_memory_access, conf.memory_callbacks_preserve_state);
                 Optimization::DeadCodeElimination(ir);
             }
             if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
