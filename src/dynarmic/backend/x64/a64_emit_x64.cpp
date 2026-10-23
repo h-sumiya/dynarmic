@@ -27,8 +27,6 @@
 #include "dynarmic/frontend/A64/a64_types.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/cond.h"
-#include "dynarmic/ir/acc_type.h"
-#include "dynarmic/ir/opt/passes.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
 
@@ -353,10 +351,7 @@ FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
 #include "dynarmic/backend/x64/a64_shared_loop.inc"
 
-#include "dynarmic/backend/x64/a64_deferred_state.inc"
-
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
-    PrepareDeferredState(block);
     if (conf.very_verbose_debugging_output) {
         std::puts(IR::DumpBlock(block).c_str());
     }

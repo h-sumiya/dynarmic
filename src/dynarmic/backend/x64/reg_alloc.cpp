@@ -292,21 +292,6 @@ bool RegAlloc::IsValueLive(IR::Inst* inst) const {
     return !!ValueLocation(inst);
 }
 
-RegAlloc::ValueSnapshot RegAlloc::SnapshotValue(IR::Value value) const {
-    if (value.IsImmediate())
-        return {true, value.GetImmediateAsU64(), HostLoc::RAX, 0};
-    const auto location = ValueLocation(value.GetInst());
-    ASSERT(location);
-    size_t offset = 0;
-    if (HostLocIsSpill(*location)) {
-        const auto index = static_cast<size_t>(*location) - static_cast<size_t>(HostLoc::FirstSpill);
-        ASSERT(index < SpillCount);
-        offset = reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill)
-            + index * sizeof(StackLayout::spill[0]);
-    }
-    return {false, 0, *location, offset};
-}
-
 Xbyak::Reg64 RegAlloc::UseGpr(Argument& arg) {
     ASSERT(!arg.allocated);
     arg.allocated = true;

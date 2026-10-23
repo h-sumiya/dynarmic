@@ -741,8 +741,6 @@ A64OPC(ReadMemory8,                                         U8,             U64,
 A64OPC(ReadMemory16,                                        U16,            U64,            U64,            AccType                         )
 A64OPC(ReadMemory32,                                        U32,            U64,            U64,            AccType                         )
 A64OPC(ReadMemory64,                                        U64,            U64,            U64,            AccType                         )
-A64OPC(DeferredStateW,                                      Void,           U8,             U32                                             )
-A64OPC(DeferredStateX,                                      Void,           U8,             U64                                             )
 A64OPC(ReadMemory128,                                       U128,           U64,            U64,            AccType                         )
 A64OPC(ExclusiveReadMemory8,                                U8,             U64,            U64,            AccType                         )
 A64OPC(ExclusiveReadMemory16,                               U16,            U64,            U64,            AccType                         )

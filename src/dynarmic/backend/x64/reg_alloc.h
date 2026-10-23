@@ -114,14 +114,6 @@ public:
     void RegisterPseudoOperation(IR::Inst* inst);
     bool IsValueLive(IR::Inst* inst) const;
 
-    struct ValueSnapshot {
-        bool immediate;
-        u64 value;
-        HostLoc location;
-        size_t spill_offset;
-    };
-    ValueSnapshot SnapshotValue(IR::Value value) const;
-
     Xbyak::Reg64 UseGpr(Argument& arg);
     Xbyak::Xmm UseXmm(Argument& arg);
     OpArg UseOpArg(Argument& arg);
