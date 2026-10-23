@@ -149,8 +149,8 @@ void A64EmitX64::EmitSharedLinkFallback(IR::LocationDescriptor target) {
 }
 
 void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
-                               IR::LocationDescriptor initial_location, bool is_single_step) {
-    const bool self_edge = next == initial_location;
+                               IR::LocationDescriptor initial_location, bool is_single_step, SharedLinkState state) {
+    const bool self_edge = state == SharedLinkState::Terminal && next == initial_location;
     std::atomic<const void*>* cell = nullptr;
     if (!self_edge && !is_single_step && shared_link_resolver
         && conf.HasOptimization(OptimizationFlag::BlockLinking)) {
@@ -173,7 +173,8 @@ void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
             ASSERT(shared_block_entrypoint);
             code.jmp(shared_block_entrypoint);
         } else {
-            EmitSharedLoopFlush();
+            if (state == SharedLinkState::Terminal)
+                EmitSharedLoopFlush();
             code.jmp(qword[rip + cell]);
         }
         code.L(fallback);
@@ -182,6 +183,10 @@ void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
             cell->store(fallback_entrypoint, std::memory_order_relaxed);
             shared_link_resolver(next.Value(), cell, fallback_entrypoint);
         }
+    }
+    if (state == SharedLinkState::EagerGuard) {
+        EmitSharedLinkFallback(next);
+        return;
     }
     code.mov(rax, A64::LocationDescriptor{next}.PC());
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
@@ -655,6 +660,59 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(args[0]).cvt8();
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+}
+
+void A64EmitX64::EmitSharedTraceCheck(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(shared_optimized && !conf.enable_cycle_counting);
+    const IR::LocationDescriptor target{args[0].GetImmediateU64()};
+    const bool test_bit = inst->GetOpcode() == IR::Opcode::A64TraceCheckBit;
+    const bool exit_on_true = args[test_bit ? 3 : 2].GetImmediateU1();
+    const auto exit = GenSharedLabel();
+    if (args[1].IsImmediate()) {
+        const u64 value = test_bit || inst->GetOpcode() == IR::Opcode::A64TraceCheckZero64
+            ? args[1].GetImmediateU64() : args[1].GetImmediateU32();
+        const bool predicate = test_bit ? ((value >> args[2].GetImmediateU8()) & 1) != 0 : value == 0;
+        if (predicate != exit_on_true)
+            return;
+        code.jmp(*exit, code.T_NEAR);
+    } else {
+        const auto value = ctx.reg_alloc.UseGpr(args[1]);
+        if (test_bit) {
+            code.bt(value, args[2].GetImmediateU8());
+            if (exit_on_true)
+                code.jc(*exit, code.T_NEAR);
+            else
+                code.jnc(*exit, code.T_NEAR);
+        } else {
+            if (inst->GetOpcode() == IR::Opcode::A64TraceCheckZero32)
+                code.test(value.cvt32(), value.cvt32());
+            else
+                code.test(value, value);
+            if (exit_on_true)
+                code.jz(*exit, code.T_NEAR);
+            else
+                code.jnz(*exit, code.T_NEAR);
+        }
+    }
+    ctx.deferred_emits.emplace_back([this, exit, target, initial = ctx.Location(), single_step = ctx.IsSingleStep()] {
+        code.L(*exit);
+        // The continuation's PC and retained-register metadata do not apply
+        // to this edge. All architectural state is eager at the guard.
+        EmitSharedLink(target, initial, single_step, SharedLinkState::EagerGuard);
+    });
+}
+
+void A64EmitX64::EmitA64TraceCheckZero32(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitSharedTraceCheck(ctx, inst);
+}
+
+void A64EmitX64::EmitA64TraceCheckZero64(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitSharedTraceCheck(ctx, inst);
+}
+
+void A64EmitX64::EmitA64TraceCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitSharedTraceCheck(ctx, inst);
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {

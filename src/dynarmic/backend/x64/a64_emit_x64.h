@@ -173,7 +173,10 @@ protected:
     void EmitSharedIndirect(IR::LocationDescriptor initial_location, bool is_single_step);
     void EmitSharedDispatchCacheIndex(Xbyak::Reg64 index, Xbyak::Reg64 location, Xbyak::Reg64 scratch);
     void EmitSharedDispatchCacheFill(Xbyak::Reg64 entrypoint, Xbyak::Reg64 location);
-    void EmitSharedLink(IR::LocationDescriptor next, IR::LocationDescriptor initial_location, bool is_single_step);
+    enum class SharedLinkState { Terminal, EagerGuard };
+    void EmitSharedLink(IR::LocationDescriptor next, IR::LocationDescriptor initial_location, bool is_single_step,
+                        SharedLinkState state = SharedLinkState::Terminal);
+    void EmitSharedTraceCheck(A64EmitContext& ctx, IR::Inst* inst);
     std::optional<IR::LocationDescriptor> shared_static_dispatch;
     const IR::Inst* shared_static_pc_inst = nullptr;
     const IR::Inst* shared_dynamic_pc_inst = nullptr;

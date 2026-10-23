@@ -114,13 +114,17 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state, bo
         // callbacks need no state reload on the normal continuation, so freeze
         // prior stores without forgetting their SSA values or upper-bit facts.
         const auto opcode = inst->GetOpcode();
+        const bool trace_guard = opcode == IR::Opcode::A64TraceCheckZero32 ||
+            opcode == IR::Opcode::A64TraceCheckZero64 || opcode == IR::Opcode::A64TraceCheckBit;
         const bool observer = inst->IsMemoryReadOrWrite() || inst->CausesCPUException() ||
             opcode == IR::Opcode::CallHostFunction || opcode == IR::Opcode::A64GetCNTPCT ||
             opcode == IR::Opcode::A64DataCacheOperationRaised ||
             opcode == IR::Opcode::A64InstructionCacheOperationRaised ||
             opcode == IR::Opcode::A64InstructionSynchronizationBarrier;
-        if (preserve_memory_fault_state && observer) {
-            if (inst->IsMemoryReadOrWrite() && memory_callbacks_preserve_state) {
+        if (trace_guard || (preserve_memory_fault_state && observer)) {
+            // A guard can leave before its continuation executes. Keep its
+            // eager state stores while forwarding values on the fallthrough.
+            if (trace_guard || (inst->IsMemoryReadOrWrite() && memory_callbacks_preserve_state)) {
                 for (auto& info : reg_info)
                     info.set_instruction_present = false;
                 for (auto& info : vec_info)

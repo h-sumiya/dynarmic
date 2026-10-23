@@ -46,8 +46,10 @@ The execution thread copies up to 64 contiguous instruction words and at most
 64 additional words from bounded direct-successor windows. The worker reads
 only this immutable snapshot, never live guest memory or execution-thread
 callbacks. It forms a trace of at most 64 executed guest instructions, following
-captured unconditional branches, calls and resolved returns. A visited target,
-conditional or unresolved branch, system-state transition, snapshot boundary
+captured unconditional branches, calls and resolved returns. One forward
+CBZ/CBNZ/TBZ/TBNZ fallthrough can join its successor through a native guard,
+ending at the successor's first branch. Cyclic traces retain their loop shape.
+A visited target, remaining conditional or unresolved branch, system-state transition, snapshot boundary
 or instruction budget ends the trace. A missing continuation dispatches to the
 correct PC; it does not synthesize an instruction-fetch fault for code that was
 merely outside the capture window. Single-step remains one guest instruction.
@@ -94,7 +96,9 @@ native and index hits do not acquire that lock.
 ## Optimizing generated code
 
 Bounded traces remove internal branch dispatch and allow constant propagation
-and register get/set elimination across the joined instructions. Arithmetic
+and register get/set elimination across the joined instructions. Native
+guards preserve architectural state on their cold direct-link exits and use
+native TEST/BT conditions without a check-bit stack round trip. Arithmetic
 selection uses x86 signed 32-bit immediates when the full 64-bit value is
 representable. The register allocator moves displaced live values to empty
 registers of the same class before using stack spills. Host-call preparation

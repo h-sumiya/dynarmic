@@ -443,7 +443,8 @@ struct SharedCodeCache::Impl {
         };
         IR::Block ir = TranslateTrace(location, get_code,
             {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions},
-            conf.HasOptimization(OptimizationFlag::GetSetElimination) && conf.HasOptimization(OptimizationFlag::ConstProp));
+            conf.HasOptimization(OptimizationFlag::GetSetElimination) && conf.HasOptimization(OptimizationFlag::ConstProp),
+            conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.enable_cycle_counting);
         if (OptimizableTerminal(ir.GetTerminal())) {
             Optimization::PolyfillPass(ir, {
                 .sha256 = !region.code.HasHostFeature(HostFeature::SHA),
