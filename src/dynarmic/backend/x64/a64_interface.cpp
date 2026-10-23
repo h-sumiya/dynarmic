@@ -35,9 +35,34 @@ namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
 
+class LookupBlockCallback final : public Callback {
+public:
+    LookupBlockCallback(CodePtr (*lookup)(void*), void* arg, bool cache_sp)
+            : callback(lookup, reinterpret_cast<u64>(arg)), cache_sp(cache_sp) {}
+
+    void EmitCall(BlockOfCode& code, std::function<void(RegList)> fn) const override {
+        callback.EmitCall(code, std::move(fn));
+        ReloadSP(code);
+    }
+
+    void EmitCallWithReturnPointer(BlockOfCode& code, std::function<void(Xbyak::Reg64, RegList)> fn) const override {
+        callback.EmitCallWithReturnPointer(code, std::move(fn));
+        ReloadSP(code);
+    }
+
+private:
+    void ReloadSP(BlockOfCode& code) const {
+        if (cache_sp)
+            code.mov(code.r14, code.qword[code.r15 + offsetof(A64JitState, sp)]);
+    }
+
+    ArgCallback callback;
+    bool cache_sp;
+};
+
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
     return RunCodeCallbacks{
-        std::make_unique<ArgCallback>(LookupBlock, reinterpret_cast<u64>(arg)),
+        std::make_unique<LookupBlockCallback>(LookupBlock, arg, !conf.page_table && conf.memory_callbacks_preserve_state),
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
@@ -48,6 +73,8 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
     return [conf](BlockOfCode& code) {
         if (conf.page_table) {
             code.mov(code.r14, mcl::bit_cast<u64>(conf.page_table));
+        } else if (conf.memory_callbacks_preserve_state) {
+            code.mov(code.r14, code.qword[code.r15 + offsetof(A64JitState, sp)]);
         }
         if (conf.fastmem_pointer && (*conf.fastmem_pointer != 0 || !conf.optimize_zero_base_fastmem)) {
             code.mov(code.r13, *conf.fastmem_pointer);

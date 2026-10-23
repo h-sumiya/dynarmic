@@ -299,6 +299,20 @@ Xbyak::Reg64 RegAlloc::UseGpr(Argument& arg) {
     return HostLocToReg64(UseImpl(arg.value, gpr_order));
 }
 
+Xbyak::Reg64 RegAlloc::UseZeroExtendedGpr(Argument& arg) {
+    ASSERT(arg.GetType() == IR::Type::U32);
+    if (arg.IsImmediate())
+        return UseGpr(arg);
+
+    // Type width does not guarantee zero upper bits. It only tells us
+    // whether clearing them preserves every live alias in this location.
+    const auto location = *ValueLocation(arg.value.GetInst());
+    const auto result = LocInfo(location).GetMaxBitWidth() <= 32
+        ? UseGpr(arg) : UseScratchGpr(arg);
+    code.mov(result.cvt32(), result.cvt32());
+    return result;
+}
+
 Xbyak::Xmm RegAlloc::UseXmm(Argument& arg) {
     ASSERT(!arg.allocated);
     arg.allocated = true;
@@ -306,6 +320,17 @@ Xbyak::Xmm RegAlloc::UseXmm(Argument& arg) {
 }
 
 OpArg RegAlloc::UseOpArg(Argument& arg) {
+    ASSERT(!arg.allocated);
+    if (!arg.IsImmediate()) {
+        const auto location = *ValueLocation(arg.value.GetInst());
+        if (HostLocIsSpill(location)) {
+            arg.allocated = true;
+            LocInfo(location).ReadLock();
+            OpArg operand{SpillToOpArg(location)};
+            operand.setBit(64);
+            return operand;
+        }
+    }
     return UseGpr(arg);
 }
 

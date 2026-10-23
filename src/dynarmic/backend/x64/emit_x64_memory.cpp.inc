@@ -118,13 +118,22 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+        const s32 displacement = SharedMemoryDisplacement(inst);
+        src_ptr = src_ptr + displacement;
+#endif
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+            const auto callback_entry = EmitSharedMemoryCallback(EmitSharedOffsetMemoryCallback(
+                mcl::bit_cast<const void*>(wrapped_fn), vaddr, displacement));
+#else
             const auto callback_entry = DYNARMIC_MEMORY_VENEER(wrapped_fn);
+#endif
             code.call(callback_entry);
 
             DYNARMIC_FASTMEM_RECORD(
@@ -195,10 +204,25 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     }
 
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
+    Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
     const int value_idx = bitsize == 128
                             ? ctx.reg_alloc.UseXmm(args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(args[2]).getIdx() : ctx.reg_alloc.UseGpr(args[2]).getIdx());
+
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    s32 displacement = SharedMemoryDisplacement(inst);
+    if constexpr (bitsize != 128) {
+        if (displacement != 0 && vaddr.getIdx() == value_idx) {
+            // The cold offset veneer changes its address register temporarily.
+            // A store of the base itself needs a separate full address so the
+            // callback still receives the original data value.
+            const auto address = ctx.reg_alloc.ScratchGpr();
+            code.lea(address, ptr[vaddr + displacement]);
+            vaddr = address;
+            displacement = 0;
+        }
+    }
+#endif
 
     const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
@@ -207,13 +231,21 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+        dest_ptr = dest_ptr + displacement;
+#endif
 
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+            const auto callback_entry = EmitSharedMemoryCallback(EmitSharedOffsetMemoryCallback(
+                mcl::bit_cast<const void*>(wrapped_fn), vaddr, displacement));
+#else
             const auto callback_entry = DYNARMIC_MEMORY_VENEER(wrapped_fn);
+#endif
             code.call(callback_entry);
 
             DYNARMIC_FASTMEM_RECORD(

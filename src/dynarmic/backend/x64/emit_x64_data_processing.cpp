@@ -1127,9 +1127,12 @@ void EmitX64::EmitMul64(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
-    OpArg op_arg = ctx.reg_alloc.UseOpArg(args[1]);
-
-    code.imul(result, *op_arg);
+    if (args[1].FitsInImmediateS32()) {
+        code.imul(result, result, static_cast<u32>(args[1].GetImmediateS32()));
+    } else {
+        OpArg op_arg = ctx.reg_alloc.UseOpArg(args[1]);
+        code.imul(result, *op_arg);
+    }
 
     ctx.reg_alloc.DefineValue(inst, result);
 }

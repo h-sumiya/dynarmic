@@ -74,8 +74,8 @@ void A64EmitX64::GenBaselineReturn() {
 
     code.align();
     shared_indirect_lookup = code.getCurr<const void*>();
-    // Entry tail-jumps into this permanent prelude with RBX naming a private
-    // cache slot. No shared return frame remains, so a C++ lookup can advance
+    // Entry tail-jumps here with RAX holding the complete descriptor and RBX
+    // naming a private cache slot. No shared return frame remains, so a C++ lookup can advance
     // the reader epoch and allow the source region to be reclaimed.
     code.cmp(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], 0);
     code.jne(code.GetForceReturnFromRunCodeAddress());
@@ -85,13 +85,7 @@ void A64EmitX64::GenBaselineReturn() {
     }
     // RBX retains the source site's private cache slot; RBP retains the
     // descriptor across any C++ lookup. Both are ABI callee-saved registers.
-    code.mov(code.rbp, code.qword[code.r15 + offsetof(A64JitState, pc)]);
-    code.mov(code.rcx, A64::LocationDescriptor::pc_mask);
-    code.and_(code.rbp, code.rcx);
-    code.mov(code.ecx, code.dword[code.r15 + offsetof(A64JitState, fpcr)]);
-    code.and_(code.ecx, A64::LocationDescriptor::fpcr_mask);
-    code.shl(code.rcx, A64::LocationDescriptor::fpcr_shift);
-    code.or_(code.rbp, code.rcx);
+    code.mov(code.rbp, code.rax);
     Xbyak::Label lookup, fill_shared;
     code.mov(code.rax, code.rbp);
     code.shr(code.rax, 2);

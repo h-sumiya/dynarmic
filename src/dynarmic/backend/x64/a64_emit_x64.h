@@ -121,6 +121,7 @@ protected:
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
+    void EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst);
 #define OPCODE(...)
 #define A32OPC(...)
 #define A64OPC(name, type, ...) void EmitA64##name(A64EmitContext& ctx, IR::Inst* inst);
@@ -131,6 +132,8 @@ protected:
 
     // Helpers
     std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const override;
+    bool UseCachedSP() const { return !conf.page_table && conf.memory_callbacks_preserve_state; }
+    void EmitReloadSP();
 
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
@@ -191,6 +194,12 @@ protected:
     void EmitSharedLoopEntry();
     void EmitSharedLoopFlush();
     const void* EmitSharedMemoryCallback(const void* callback);
+    // Single-use base+disp32 addresses fold into the fastmem load operand.
+    tsl::robin_map<const IR::Inst*, s32> shared_memory_addresses;
+    void PrepareSharedMemoryAddresses(IR::Block& block);
+    bool EmitSharedMemoryAddress(A64EmitContext& ctx, IR::Inst* inst);
+    s32 SharedMemoryDisplacement(IR::Inst* inst) const;
+    const void* EmitSharedOffsetMemoryCallback(const void* callback, Xbyak::Reg64 base, s32 displacement);
     // Terminal-only predicates stay in host flags instead of making a U1
     // round trip through a register and the dispatcher stack.
     IR::Inst* shared_check_bit_producer = nullptr;

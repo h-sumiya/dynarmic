@@ -174,6 +174,10 @@ private:
     std::array<A64BaselineFault, 1024> faults{};
     unsigned fault_count = 0;
 
+    bool UseCachedSP() const {
+        return !config.page_table && config.memory_callbacks_preserve_state;
+    }
+
     bool FastMemory() const {
         // More general page-table/mirrored layouts stay with precise callbacks.
         // A process-specific base never appears in the immutable machine code.
@@ -201,6 +205,13 @@ private:
             xor_(destination.cvt32(), destination.cvt32());
             return;
         }
+        if (guest == 31 && UseCachedSP()) {
+            if (wide)
+                mov(destination, r14);
+            else
+                mov(destination.cvt32(), r14d);
+            return;
+        }
         for (unsigned i = 0; i < slots.size(); ++i) {
             if (slots[i].guest == static_cast<int>(guest)) {
                 if (wide)
@@ -219,6 +230,14 @@ private:
     void Write(unsigned guest, const Xbyak::Reg64& source, bool wide = true, bool sp = false) {
         if (guest == 31 && !sp)
             return;
+        if (guest == 31 && UseCachedSP()) {
+            if (wide)
+                mov(r14, source);
+            else
+                mov(r14d, source.cvt32());
+            mov(qword[r15 + offsetof(A64JitState, sp)], r14);
+            return;
+        }
         unsigned slot = replacement;
         for (unsigned i = 0; i < slots.size(); ++i) {
             if (slots[i].guest == static_cast<int>(guest)) {
@@ -451,6 +470,10 @@ private:
             lea(rdx, ptr[rsp + ABI_SHADOW_SPACE]);
 #endif
         call(ptr[r15 + helper_offset]);
+        // Memory helpers can write SP through indexed addressing, and system
+        // or exception callbacks may replace it before returning to native code.
+        if (UseCachedSP())
+            mov(r14, qword[r15 + offsetof(A64JitState, sp)]);
         EnterGuest();
         if (terminal) {
             Return(offset / 4 + 1);

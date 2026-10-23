@@ -53,7 +53,9 @@ struct A64BaselineBlock {
 /// next instruction or exact faulting instruction, and all architectural state
 /// is materialized. Edges use the thread's A64JitState::baseline_return;
 /// self-edges check halt and instruction budget before repeating. r14 retains
-/// the thread's page-table base. For 64-bit unmirrored fastmem, r13 supplies the
+/// the page-table base, or SP when there is no page table and memory callbacks
+/// preserve architectural state. Cached SP writes also update state.sp.
+/// For 64-bit unmirrored fastmem, r13 supplies the
 /// base unless optimize_zero_base_fastmem permits direct guest addresses.
 /// The caller must install the immutable fault records before executing code.
 std::optional<A64BaselineBlock> CompileA64Baseline(

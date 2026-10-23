@@ -116,7 +116,8 @@ void A64EmitX64::PrepareSharedDispatch(IR::Block& block) {
     // require the general dispatcher because they can change the descriptor.
     for (const auto& inst : block) {
         const auto op = inst.GetOpcode();
-        if (inst.WritesToFPCR() || inst.IsMemoryRead() || inst.IsMemoryWrite()
+        if (inst.WritesToFPCR()
+            || ((inst.IsMemoryRead() || inst.IsMemoryWrite()) && !conf.memory_callbacks_preserve_state)
             || inst.CausesCPUException() || op == IR::Opcode::CallHostFunction
             || op == IR::Opcode::A64DataCacheOperationRaised
             || op == IR::Opcode::A64InstructionCacheOperationRaised
@@ -355,6 +356,7 @@ FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
 
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
 #include "dynarmic/backend/x64/a64_shared_loop.inc"
+#include "dynarmic/backend/x64/a64_memory_address.inc"
 
 void A64EmitX64::PrepareSharedBranch(IR::Block& block) {
     shared_check_bit_producer = nullptr;
@@ -422,7 +424,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     PrepareSharedDispatch(block);
     std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table) {
+        if (conf.page_table || UseCachedSP()) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
         }
         if (conf.fastmem_pointer && (*conf.fastmem_pointer != 0 || !conf.optimize_zero_base_fastmem)) {
@@ -433,6 +435,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     PrepareSharedLoop(block, gpr_order);
     PrepareSharedBranch(block);
+    PrepareSharedMemoryAddresses(block);
     RegAlloc reg_alloc{code, std::move(gpr_order), any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
 
@@ -446,6 +449,11 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     for (auto iter = block.begin(); iter != block.end(); ++iter) {
         IR::Inst* inst = &*iter;
+
+        if (EmitSharedMemoryAddress(ctx, inst)) {
+            ctx.reg_alloc.EndOfAllocScope();
+            continue;
+        }
 
         if (inst == shared_check_bit_producer) {
             EmitSharedCheckBit(ctx, inst);
@@ -662,6 +670,11 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
 }
 
+void A64EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
+    EmitX64::EmitCallHostFunction(ctx, inst);
+    EmitReloadSP();
+}
+
 void A64EmitX64::EmitSharedTraceCheck(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(shared_optimized && !conf.enable_cycle_counting);
@@ -760,7 +773,7 @@ void A64EmitX64::EmitA64SetNZCVRaw(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(args[0]).cvt32();
+    const Xbyak::Reg32 to_store = ctx.reg_alloc.UseGpr(args[0]).cvt32();
     if (shared_loop_flags)
         code.mov(r10d, to_store);
     else
@@ -818,8 +831,16 @@ void A64EmitX64::EmitA64GetQ(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetSP(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    code.mov(result, qword[r15 + offsetof(A64JitState, sp)]);
+    if (UseCachedSP())
+        code.mov(result, r14);
+    else
+        code.mov(result, qword[r15 + offsetof(A64JitState, sp)]);
     ctx.reg_alloc.DefineValue(inst, result);
+}
+
+void A64EmitX64::EmitReloadSP() {
+    if (UseCachedSP())
+        code.mov(r14, qword[r15 + offsetof(A64JitState, sp)]);
 }
 
 void A64EmitX64::EmitA64GetFPCR(A64EmitContext& ctx, IR::Inst* inst) {
@@ -854,9 +875,7 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
     } else {
-        // TODO: zext tracking, xmm variant
-        const Xbyak::Reg64 to_store = ctx.reg_alloc.UseScratchGpr(args[1]);
-        code.mov(to_store.cvt32(), to_store.cvt32());
+        const Xbyak::Reg64 to_store = ctx.reg_alloc.UseZeroExtendedGpr(args[1]);
         code.mov(addr, to_store);
     }
 }
@@ -893,9 +912,12 @@ void A64EmitX64::EmitA64SetS(A64EmitContext& ctx, IR::Inst* inst) {
 
     const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(args[1]);
     const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
-    // TODO: Optimize
-    code.pxor(tmp, tmp);
-    code.movss(tmp, to_store);
+    if (code.HasHostFeature(HostFeature::AVX)) {
+        code.vinsertps(tmp, to_store, to_store, 0b00001110);
+    } else {
+        code.pxor(tmp, tmp);
+        code.movss(tmp, to_store);
+    }
     code.movaps(addr, tmp);
 }
 
@@ -921,6 +943,16 @@ void A64EmitX64::EmitA64SetQ(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetSP(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const auto addr = qword[r15 + offsetof(A64JitState, sp)];
+    if (UseCachedSP()) {
+        if (args[0].IsImmediate())
+            code.mov(r14, args[0].GetImmediateU64());
+        else if (args[0].IsInXmm())
+            code.movq(r14, ctx.reg_alloc.UseXmm(args[0]));
+        else
+            code.mov(r14, ctx.reg_alloc.UseGpr(args[0]));
+        code.mov(addr, r14);
+        return;
+    }
     if (args[0].FitsInImmediateS32()) {
         code.mov(addr, args[0].GetImmediateS32());
     } else if (args[0].IsInXmm()) {
@@ -988,6 +1020,7 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     GetUserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
+    EmitReloadSP();
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
 }
@@ -1002,18 +1035,21 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
         code.mov(param[0], pc);
         code.mov(param[1], exception);
     });
+    EmitReloadSP();
 }
 
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
     GetUserCallback<&A64::UserCallbacks::DataCacheOperationRaised>().EmitCall(code);
+    EmitReloadSP();
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[0], args[1]);
     GetUserCallback<&A64::UserCallbacks::InstructionCacheOperationRaised>().EmitCall(code);
+    EmitReloadSP();
 }
 
 void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
@@ -1032,6 +1068,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
 
     ctx.reg_alloc.HostCall(nullptr);
     GetUserCallback<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>().EmitCall(code);
+    EmitReloadSP();
 }
 
 void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
@@ -1046,6 +1083,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
         code.UpdateTicks();
     }
     GetUserCallback<&A64::UserCallbacks::GetCNTPCT>().EmitCall(code);
+    EmitReloadSP();
 }
 
 void A64EmitX64::EmitA64GetCTR(A64EmitContext& ctx, IR::Inst* inst) {
@@ -1127,6 +1165,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::Interpret terminal, IR::LocationDesc
         code.mov(qword[r15 + offsetof(A64JitState, pc)], param[0]);
         code.mov(param[1].cvt32(), terminal.num_instructions);
     });
+    EmitReloadSP();
     if (shared_optimized) {
         code.SwitchMxcsrOnEntry();
         EmitSharedDispatch();

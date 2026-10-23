@@ -440,8 +440,9 @@ Emitter::Result Emitter::SimdInstruction(u32 instruction) {
     if (fp_scalar_binary || fp_scalar_sqrt || fp_vector) {
         const unsigned width = 32 << (size & 1), lanes = fp_vector ? (q ? 128 : 64) / width : 1;
         const unsigned operation = fp_scalar_sqrt ? 4 : fp_scalar_binary ? (i >> 12) & 15 : op == 26 ? ((size & 2) ? 3 : 2) : op == 27 ? 0 : 1;
+        const bool scalar_add_sub = fp_scalar_binary && operation >= 2;
         ReadVector(n, xmm0); if (operation != 4) ReadVector(m, xmm1);
-        Xbyak::Label slow, restore, done;
+        Xbyak::Label slow, restore, done, left_zero, right_zero, left_ready, right_ready;
         test(dword[r15 + offsetof(A64JitState, fpcr)], 0x9f00);
         jnz(slow, T_NEAR);
         constant(xmm5, width == 32 ? 0x7f8000007f800000ull : 0x7ff0000000000000ull);
@@ -460,7 +461,10 @@ Emitter::Result Emitter::SimdInstruction(u32 instruction) {
             test(eax, active);
             jnz(exceptional, T_NEAR);
         };
-        normal(xmm0, slow); if (operation != 4) normal(xmm1, slow);
+        normal(xmm0, scalar_add_sub || fp_scalar_sqrt ? left_zero : slow);
+        L(left_ready);
+        if (operation != 4) normal(xmm1, scalar_add_sub ? right_zero : slow);
+        L(right_ready);
         if (fp_vector && !q) {
             // Packed SSE processes all 128 bits. Fill unused high lanes with
             // 1.0 so they cannot add exceptions (particularly for division).
@@ -492,6 +496,26 @@ Emitter::Result Emitter::SimdInstruction(u32 instruction) {
         if (!fp_vector) isolate(xmm0, width / 8);
         else if (!q) movq(xmm0, xmm0);
         jmp(done, T_NEAR);
+        // Signed zeros use a cold check without extending the normal-input
+        // path. Subnormal and non-finite values still need the exact veneer.
+        const auto exact_zero = [&](const Xbyak::Xmm& value) {
+            if (width == 32) { movd(eax, value); shl(eax, 1); }
+            else { movq(rax, value); shl(rax, 1); }
+            jnz(slow, T_NEAR);
+        };
+        if (scalar_add_sub || fp_scalar_sqrt) {
+            L(left_zero);
+            exact_zero(xmm0);
+            if (fp_scalar_sqrt) {
+                isolate(xmm0, width / 8);
+                jmp(done, T_NEAR);
+            } else {
+                jmp(left_ready, T_NEAR);
+                L(right_zero);
+                exact_zero(xmm1);
+                jmp(right_ready, T_NEAR);
+            }
+        }
         L(restore); ldmxcsr(dword[r15 + offsetof(A64JitState, guest_MXCSR)]);
         L(slow);
         // Preserve the compile-time cache map across a conditional helper.

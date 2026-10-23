@@ -115,6 +115,7 @@ public:
     bool IsValueLive(IR::Inst* inst) const;
 
     Xbyak::Reg64 UseGpr(Argument& arg);
+    Xbyak::Reg64 UseZeroExtendedGpr(Argument& arg);
     Xbyak::Xmm UseXmm(Argument& arg);
     OpArg UseOpArg(Argument& arg);
     void Use(Argument& arg, HostLoc host_loc);

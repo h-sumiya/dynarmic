@@ -62,7 +62,7 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
     TranslatorVisitor visitor{block, descriptor, options};
     std::array<u64, 64> visited{};
     std::size_t visited_count = 0;
-    bool has_guard = false;
+    unsigned guard_count = 0;
 
     while (visited_count < visited.size()) {
         const auto current = *visitor.ir.current_location;
@@ -93,9 +93,7 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
             }
             continue;
         }
-        // A guarded continuation ends at its first branch, including an
-        // unconditional branch or return. It cannot grow another trace tail.
-        if (!instruction || visited_count == visited.size() || has_guard)
+        if (!instruction || visited_count == visited.size())
             break;
 
         // Only architectural branches are merge candidates. Other LinkBlock
@@ -109,8 +107,13 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
         std::optional<LocationDescriptor> next;
         IR::Inst* branch_set_pc = nullptr;
         const auto terminal = block.GetTerminal();
-        if (const auto* branch = boost::get<IR::Term::CheckBit>(&terminal);
-            conditional_fallthrough && branch) {
+        const auto* branch = boost::get<IR::Term::CheckBit>(&terminal);
+        // A guarded continuation can join one more CB/TB fallthrough. Other
+        // branches and returns end the trace without following another tail.
+        if (guard_count && (!branch || guard_count == 2))
+            break;
+        bool added_guard = false;
+        if (conditional_fallthrough && branch) {
             const auto* yes = boost::get<IR::Term::LinkBlock>(&branch->then_);
             const auto* no = boost::get<IR::Term::LinkBlock>(&branch->else_);
             const auto continuation = current.AdvancePC(4);
@@ -133,14 +136,15 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
                     if (opcode == IR::Opcode::IsZero32 || opcode == IR::Opcode::IsZero64) {
                         block.AppendNewInst(opcode == IR::Opcode::IsZero32 ? IR::Opcode::A64TraceCheckZero32 : IR::Opcode::A64TraceCheckZero64,
                             {IR::Value(exit.UniqueHash()), predicate->GetArg(0), IR::Value(exit_on_true)});
-                        has_guard = true;
+                        added_guard = true;
                     } else if (opcode == IR::Opcode::TestBit && predicate->GetArg(1).IsImmediate() &&
                                predicate->GetArg(1).GetU8() < 64) {
                         block.AppendNewInst(IR::Opcode::A64TraceCheckBit,
                             {IR::Value(exit.UniqueHash()), predicate->GetArg(0), predicate->GetArg(1), IR::Value(exit_on_true)});
-                        has_guard = true;
+                        added_guard = true;
                     }
-                    if (has_guard) {
+                    if (added_guard) {
+                        ++guard_count;
                         setter->Invalidate();
                         block.Instructions().erase(setter);
                         if (!predicate->HasUses()) {
@@ -199,7 +203,7 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
         visitor.ir.current_location = *next;
     }
     ASSERT_MSG(block.HasTerminal(), "Trace terminal has not been set");
-    if (has_guard) {
+    if (guard_count) {
         const auto revisits = [&](const auto& self, const IR::Terminal& terminal) -> bool {
             const auto seen = [&](IR::LocationDescriptor target) {
                 const auto pc = LocationDescriptor{target}.PC();
