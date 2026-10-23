@@ -42,7 +42,26 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state, bo
     RegisterInfo nzcv_info;
     IR::IREmitter ir{block};
 
-    const auto do_set = [&block](RegisterInfo& info, IR::Value value, Iterator set_inst, TrackingType tracking_type) {
+    const auto same_value = [](IR::Value a, IR::Value b) {
+        if (a.IsEmpty() || b.IsEmpty() || a.GetType() != b.GetType())
+            return false;
+        if (!a.IsImmediate() && !b.IsImmediate())
+            return a.GetInstRecursive() == b.GetInstRecursive();
+        if (a.IsImmediate() && b.IsImmediate() && (a.GetType() == IR::Type::U32 || a.GetType() == IR::Type::U64))
+            return a.GetImmediateAsU64() == b.GetImmediateAsU64();
+        return false;
+    };
+    const auto do_set = [&block, &same_value](RegisterInfo& info, IR::Value value, Iterator set_inst, TrackingType tracking_type) {
+        const bool preserves_upper = tracking_type != TrackingType::S && tracking_type != TrackingType::D
+            && (tracking_type != TrackingType::W || info.known_zero_upper);
+        if (preserves_upper && !info.register_value.IsEmpty()
+            && info.tracking_type == tracking_type && same_value(info.register_value, value)) {
+            // The architectural value is already visible. Keep any preceding
+            // store, including one frozen by a memory observer, and discard
+            // only this redundant assignment. DCE removes the invalidated node.
+            set_inst->Invalidate();
+            return;
+        }
         if (info.set_instruction_present) {
             info.last_set_instruction->Invalidate();
             block.Instructions().erase(info.last_set_instruction);
