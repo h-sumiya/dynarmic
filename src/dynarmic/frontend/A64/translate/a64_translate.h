@@ -47,8 +47,8 @@ struct TranslationOptions {
 IR::Block Translate(LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options);
 
 /**
- * Forms a bounded trace from an immutable code snapshot. Up to two guarded
- * CBZ/CBNZ/TBZ/TBNZ fallthroughs join successors; other branches end a guarded trace.
+ * Forms a bounded trace from an immutable code snapshot. Up to four guarded
+ * CBZ/CBNZ/TBZ/TBNZ/B.cond fallthroughs join successors; other branches end a guarded trace.
  * Repeated PCs, missing code and the 64-instruction budget end the trace.
  * Constant indirect targets require the relevant optimizations; architectural
  * register and precise memory-fault state is retained.

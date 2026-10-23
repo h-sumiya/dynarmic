@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -133,7 +134,11 @@ protected:
     // Helpers
     std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const override;
     bool UseCachedSP() const { return !conf.page_table && conf.memory_callbacks_preserve_state; }
-    void EmitReloadSP();
+    bool UseCachedFP() const {
+        return UseCachedSP() && conf.optimize_zero_base_fastmem &&
+            conf.fastmem_pointer == uintptr_t{0} && conf.fastmem_address_space_bits == 64;
+    }
+    void EmitReloadCachedRegisters();
 
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
@@ -194,10 +199,14 @@ protected:
     void EmitSharedLoopEntry();
     void EmitSharedLoopFlush();
     const void* EmitSharedMemoryCallback(const void* callback);
-    // Single-use base+disp32 addresses fold into the fastmem load operand.
+    // Single-use base+disp32 addresses fold into fastmem operands. SP/X29 values
+    // used only by memory can share their stable cached host register.
     tsl::robin_map<const IR::Inst*, s32> shared_memory_addresses;
+    tsl::robin_map<const IR::Inst*, HostLoc> shared_memory_cached_values;
+    tsl::robin_map<const IR::Inst*, HostLoc> shared_memory_cached_accesses;
     void PrepareSharedMemoryAddresses(IR::Block& block);
     bool EmitSharedMemoryAddress(A64EmitContext& ctx, IR::Inst* inst);
+    Xbyak::Reg64 UseSharedMemoryAddress(A64EmitContext& ctx, IR::Inst* inst, Argument& address);
     s32 SharedMemoryDisplacement(IR::Inst* inst) const;
     const void* EmitSharedOffsetMemoryCallback(const void* callback, Xbyak::Reg64 base, s32 displacement);
     // Terminal-only predicates stay in host flags instead of making a U1
@@ -205,6 +214,7 @@ protected:
     IR::Inst* shared_check_bit_producer = nullptr;
     IR::Cond shared_check_bit_condition = IR::Cond::AL;
     bool shared_branch_flags = false;
+    std::set<const IR::Inst*> shared_native_flag_guards;
     void PrepareSharedBranch(IR::Block& block);
     void EmitSharedCheckBit(A64EmitContext& ctx, IR::Inst* inst);
 

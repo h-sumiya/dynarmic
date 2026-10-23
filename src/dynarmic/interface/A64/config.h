@@ -249,8 +249,8 @@ struct UserConfig {
     /// MemoryRead*/MemoryWrite* callbacks.
     std::optional<uintptr_t> fastmem_pointer = std::nullopt;
     /// On x64, omit the base register when fastmem_pointer is zero. Guest
-    /// addresses then already name host memory, so the base register is made
-    /// available to the register allocator. Bounds checks, address mirroring,
+    /// addresses then already name host memory, so the base register can hold
+    /// X29 or an allocated value. Bounds checks, address mirroring,
     /// fault callbacks and exclusive access semantics remain unchanged.
     /// Disable to compare against the base-register implementation.
     bool optimize_zero_base_fastmem = true;

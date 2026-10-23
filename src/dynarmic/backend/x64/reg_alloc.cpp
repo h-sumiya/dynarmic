@@ -20,6 +20,7 @@
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/backend/x64/verbose_debugging_output.h"
+#include "dynarmic/ir/opcodes.h"
 
 namespace Dynarmic::Backend::X64 {
 
@@ -300,16 +301,49 @@ Xbyak::Reg64 RegAlloc::UseGpr(Argument& arg) {
 }
 
 Xbyak::Reg64 RegAlloc::UseZeroExtendedGpr(Argument& arg) {
-    ASSERT(arg.GetType() == IR::Type::U32);
+    ASSERT(arg.GetType() == IR::Type::U8 || arg.GetType() == IR::Type::U16 || arg.GetType() == IR::Type::U32);
     if (arg.IsImmediate())
         return UseGpr(arg);
 
+    // These emitters clear every bit above their result type on every path.
+    // Their upper zeros survive allocator moves, spills and read-only aliases.
+    switch (arg.value.GetInst()->GetOpcode()) {
+    case IR::Opcode::A64ReadMemory8:
+    case IR::Opcode::A64ReadMemory16:
+    case IR::Opcode::LeastSignificantByte:
+    case IR::Opcode::LeastSignificantHalf:
+    case IR::Opcode::VectorGetElement8:
+    case IR::Opcode::VectorGetElement16:
+    case IR::Opcode::A64GetW:
+    case IR::Opcode::A64ReadMemory32:
+    case IR::Opcode::Add32:
+    case IR::Opcode::Sub32:
+    case IR::Opcode::Mul32:
+    case IR::Opcode::And32:
+    case IR::Opcode::AndNot32:
+    case IR::Opcode::Eor32:
+    case IR::Opcode::Or32:
+    case IR::Opcode::Not32:
+    case IR::Opcode::UnsignedDiv32:
+    case IR::Opcode::LeastSignificantWord:
+    case IR::Opcode::ZeroExtendByteToWord:
+    case IR::Opcode::ZeroExtendHalfToWord:
+    case IR::Opcode::SignExtendByteToWord:
+    case IR::Opcode::SignExtendHalfToWord:
+    case IR::Opcode::ByteReverseWord:
+    case IR::Opcode::VectorGetElement32:
+        return UseGpr(arg);
+    default:
+        break;
+    }
+
     // Type width does not guarantee zero upper bits. It only tells us
     // whether clearing them preserves every live alias in this location.
+    const size_t bit_width = GetBitWidth(arg.GetType());
     const auto location = *ValueLocation(arg.value.GetInst());
-    const auto result = LocInfo(location).GetMaxBitWidth() <= 32
+    const auto result = LocInfo(location).GetMaxBitWidth() <= bit_width
         ? UseGpr(arg) : UseScratchGpr(arg);
-    code.mov(result.cvt32(), result.cvt32());
+    code.ZeroExtendFrom(bit_width, result);
     return result;
 }
 

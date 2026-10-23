@@ -46,6 +46,7 @@ A64OPC(SetCheckBit,                                         Void,           U1  
 A64OPC(TraceCheckZero32,                                    Void,           U64,            U32,            U1                              )
 A64OPC(TraceCheckZero64,                                    Void,           U64,            U64,            U1                              )
 A64OPC(TraceCheckBit,                                       Void,           U64,            U64,            U8,             U1              )
+A64OPC(TraceCheckCond,                                      Void,           U64,            Cond                                                            )
 A64OPC(GetCFlag,                                            U1,                                                                             )
 A64OPC(GetNZCVRaw,                                          U32,                                                                            )
 A64OPC(SetNZCVRaw,                                          Void,           U32                                                             )

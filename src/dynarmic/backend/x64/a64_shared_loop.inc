@@ -166,15 +166,14 @@ void A64EmitX64::PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_o
     if (memory_loop && (!conf.memory_callbacks_preserve_state ||
         !conf.fastmem_pointer || !exception_handler.SupportsFastmem()))
         return;
-    // Reserve only two registers, leaving the general instruction selector
-    // enough scratch registers even when an operation requires RAX/RCX/RDX.
-    // These are not fixed scratch registers in scalar IR emission.
-    for (const HostLoc host : {HostLoc::R12, HostLoc::RBP}) {
+    // Retain at most three values, keeping fixed scalar scratch registers
+    // available. R13 participates only when fastmem and X29 leave it unreserved.
+    for (const HostLoc host : {HostLoc::R12, HostLoc::RBP, HostLoc::R13}) {
         unsigned best = 31, best_score = 0;
         for (unsigned guest = 0; guest < reads.size(); ++guest) {
-            if (shared_loop_registers[guest] || !reads[guest] || !writes[guest])
+            if (shared_loop_registers[guest] || !reads[guest] || (guest == 29 && UseCachedFP()))
                 continue;
-            const unsigned score = reads[guest] + writes[guest];
+            const unsigned score = reads[guest] + 2 * writes[guest];
             if (score > best_score) {
                 best = guest;
                 best_score = score;

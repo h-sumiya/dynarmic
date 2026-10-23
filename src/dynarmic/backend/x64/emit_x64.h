@@ -107,7 +107,7 @@ protected:
     void EmitAddCycles(size_t cycles);
     // Live flags must already have ARM's carry convention. This is used
     // only when the caller proves no flag-clobbering instruction intervened.
-    Xbyak::Label EmitCond(IR::Cond cond, bool flags_are_live = false);
+    Xbyak::Label EmitCond(IR::Cond cond, bool flags_are_live = false, Xbyak::CodeGenerator::LabelType distance = Xbyak::CodeGenerator::T_AUTO);
     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 

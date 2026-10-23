@@ -108,14 +108,18 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
         IR::Inst* branch_set_pc = nullptr;
         const auto terminal = block.GetTerminal();
         const auto* branch = boost::get<IR::Term::CheckBit>(&terminal);
-        // A guarded continuation can join one more CB/TB fallthrough. Other
+        const auto* condition = (*instruction & 0xff000010u) == 0x54000000u
+            ? boost::get<IR::Term::If>(&terminal) : nullptr;
+        if (condition && condition->if_ >= IR::Cond::AL)
+            condition = nullptr;
+        // A guarded continuation can join additional conditional fallthroughs. Other
         // branches and returns end the trace without following another tail.
-        if (guard_count && (!branch || guard_count == 2))
+        if (guard_count && ((!branch && !condition) || guard_count == 4))
             break;
         bool added_guard = false;
-        if (conditional_fallthrough && branch) {
-            const auto* yes = boost::get<IR::Term::LinkBlock>(&branch->then_);
-            const auto* no = boost::get<IR::Term::LinkBlock>(&branch->else_);
+        if (conditional_fallthrough && (branch || condition)) {
+            const auto* yes = boost::get<IR::Term::LinkBlock>(branch ? &branch->then_ : &condition->then_);
+            const auto* no = boost::get<IR::Term::LinkBlock>(branch ? &branch->else_ : &condition->else_);
             const auto continuation = current.AdvancePC(4);
             const auto seen = [&](u64 address) {
                 return std::find(visited.begin(), visited.begin() + visited_count, address) != visited.begin() + visited_count;
@@ -127,30 +131,38 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
                 // a forward branch can still return to the trace's entry.
                 if (exit.PC() > pc && exit != continuation && !seen(exit.PC()) &&
                     continuation.SetPC(descriptor.PC()) == descriptor &&
-                    !seen(continuation.PC()) && memory_read_code(continuation.PC()) &&
-                    !block.empty() && block.back().GetOpcode() == IR::Opcode::A64SetCheckBit &&
-                    !block.back().GetArg(0).IsImmediate()) {
-                    auto* setter = &block.back();
-                    auto* predicate = setter->GetArg(0).GetInst();
-                    const auto opcode = predicate->GetOpcode();
-                    if (opcode == IR::Opcode::IsZero32 || opcode == IR::Opcode::IsZero64) {
-                        block.AppendNewInst(opcode == IR::Opcode::IsZero32 ? IR::Opcode::A64TraceCheckZero32 : IR::Opcode::A64TraceCheckZero64,
-                            {IR::Value(exit.UniqueHash()), predicate->GetArg(0), IR::Value(exit_on_true)});
+                    !seen(continuation.PC()) && memory_read_code(continuation.PC())) {
+                    if (condition) {
+                        const auto cond = exit_on_true ? condition->if_ : static_cast<IR::Cond>(static_cast<unsigned>(condition->if_) ^ 1);
+                        block.AppendNewInst(IR::Opcode::A64TraceCheckCond,
+                            {IR::Value(exit.UniqueHash()), IR::Value(cond)});
                         added_guard = true;
-                    } else if (opcode == IR::Opcode::TestBit && predicate->GetArg(1).IsImmediate() &&
-                               predicate->GetArg(1).GetU8() < 64) {
-                        block.AppendNewInst(IR::Opcode::A64TraceCheckBit,
-                            {IR::Value(exit.UniqueHash()), predicate->GetArg(0), predicate->GetArg(1), IR::Value(exit_on_true)});
-                        added_guard = true;
+                    } else if (!block.empty() && block.back().GetOpcode() == IR::Opcode::A64SetCheckBit &&
+                               !block.back().GetArg(0).IsImmediate()) {
+                        auto* setter = &block.back();
+                        auto* predicate = setter->GetArg(0).GetInst();
+                        const auto opcode = predicate->GetOpcode();
+                        if (opcode == IR::Opcode::IsZero32 || opcode == IR::Opcode::IsZero64) {
+                            block.AppendNewInst(opcode == IR::Opcode::IsZero32 ? IR::Opcode::A64TraceCheckZero32 : IR::Opcode::A64TraceCheckZero64,
+                                {IR::Value(exit.UniqueHash()), predicate->GetArg(0), IR::Value(exit_on_true)});
+                            added_guard = true;
+                        } else if (opcode == IR::Opcode::TestBit && predicate->GetArg(1).IsImmediate() &&
+                                   predicate->GetArg(1).GetU8() < 64) {
+                            block.AppendNewInst(IR::Opcode::A64TraceCheckBit,
+                                {IR::Value(exit.UniqueHash()), predicate->GetArg(0), predicate->GetArg(1), IR::Value(exit_on_true)});
+                            added_guard = true;
+                        }
+                        if (added_guard) {
+                            setter->Invalidate();
+                            block.Instructions().erase(setter);
+                            if (!predicate->HasUses()) {
+                                predicate->Invalidate();
+                                block.Instructions().erase(predicate);
+                            }
+                        }
                     }
                     if (added_guard) {
                         ++guard_count;
-                        setter->Invalidate();
-                        block.Instructions().erase(setter);
-                        if (!predicate->HasUses()) {
-                            predicate->Invalidate();
-                            block.Instructions().erase(predicate);
-                        }
                         next = continuation;
                     }
                 }

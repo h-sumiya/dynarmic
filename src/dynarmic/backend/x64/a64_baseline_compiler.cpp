@@ -178,6 +178,11 @@ private:
         return !config.page_table && config.memory_callbacks_preserve_state;
     }
 
+    bool UseCachedFP() const {
+        return UseCachedSP() && config.optimize_zero_base_fastmem &&
+               config.fastmem_pointer == uintptr_t{0} && config.fastmem_address_space_bits == 64;
+    }
+
     bool FastMemory() const {
         // More general page-table/mirrored layouts stay with precise callbacks.
         // A process-specific base never appears in the immutable machine code.
@@ -212,6 +217,13 @@ private:
                 mov(destination.cvt32(), r14d);
             return;
         }
+        if (guest == 29 && UseCachedFP()) {
+            if (wide)
+                mov(destination, r13);
+            else
+                mov(destination.cvt32(), r13d);
+            return;
+        }
         for (unsigned i = 0; i < slots.size(); ++i) {
             if (slots[i].guest == static_cast<int>(guest)) {
                 if (wide)
@@ -236,6 +248,14 @@ private:
             else
                 mov(r14d, source.cvt32());
             mov(qword[r15 + offsetof(A64JitState, sp)], r14);
+            return;
+        }
+        if (guest == 29 && UseCachedFP()) {
+            if (wide)
+                mov(r13, source);
+            else
+                mov(r13d, source.cvt32());
+            mov(qword[r15 + RegisterOffset(guest)], r13);
             return;
         }
         unsigned slot = replacement;
@@ -470,10 +490,12 @@ private:
             lea(rdx, ptr[rsp + ABI_SHADOW_SPACE]);
 #endif
         call(ptr[r15 + helper_offset]);
-        // Memory helpers can write SP through indexed addressing, and system
-        // or exception callbacks may replace it before returning to native code.
+        // Helpers and callbacks may replace cached architectural registers
+        // before returning to native code, including indexed-address writeback.
         if (UseCachedSP())
             mov(r14, qword[r15 + offsetof(A64JitState, sp)]);
+        if (UseCachedFP())
+            mov(r13, qword[r15 + RegisterOffset(29)]);
         EnterGuest();
         if (terminal) {
             Return(offset / 4 + 1);

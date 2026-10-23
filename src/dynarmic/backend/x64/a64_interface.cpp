@@ -35,34 +35,44 @@ namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
 
+static bool UseCachedFramePointer(const A64::UserConfig& conf) {
+    return !conf.page_table && conf.memory_callbacks_preserve_state &&
+        conf.optimize_zero_base_fastmem && conf.fastmem_pointer == uintptr_t{0} &&
+        conf.fastmem_address_space_bits == 64;
+}
+
 class LookupBlockCallback final : public Callback {
 public:
-    LookupBlockCallback(CodePtr (*lookup)(void*), void* arg, bool cache_sp)
-            : callback(lookup, reinterpret_cast<u64>(arg)), cache_sp(cache_sp) {}
+    LookupBlockCallback(CodePtr (*lookup)(void*), void* arg, bool cache_sp, bool cache_fp)
+            : callback(lookup, reinterpret_cast<u64>(arg)), cache_sp(cache_sp), cache_fp(cache_fp) {}
 
     void EmitCall(BlockOfCode& code, std::function<void(RegList)> fn) const override {
         callback.EmitCall(code, std::move(fn));
-        ReloadSP(code);
+        ReloadCachedRegisters(code);
     }
 
     void EmitCallWithReturnPointer(BlockOfCode& code, std::function<void(Xbyak::Reg64, RegList)> fn) const override {
         callback.EmitCallWithReturnPointer(code, std::move(fn));
-        ReloadSP(code);
+        ReloadCachedRegisters(code);
     }
 
 private:
-    void ReloadSP(BlockOfCode& code) const {
+    void ReloadCachedRegisters(BlockOfCode& code) const {
         if (cache_sp)
             code.mov(code.r14, code.qword[code.r15 + offsetof(A64JitState, sp)]);
+        if (cache_fp)
+            code.mov(code.r13, code.qword[code.r15 + offsetof(A64JitState, reg) + 29 * sizeof(u64)]);
     }
 
     ArgCallback callback;
     bool cache_sp;
+    bool cache_fp;
 };
 
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
     return RunCodeCallbacks{
-        std::make_unique<LookupBlockCallback>(LookupBlock, arg, !conf.page_table && conf.memory_callbacks_preserve_state),
+        std::make_unique<LookupBlockCallback>(LookupBlock, arg,
+            !conf.page_table && conf.memory_callbacks_preserve_state, UseCachedFramePointer(conf)),
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
@@ -78,6 +88,8 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
         }
         if (conf.fastmem_pointer && (*conf.fastmem_pointer != 0 || !conf.optimize_zero_base_fastmem)) {
             code.mov(code.r13, *conf.fastmem_pointer);
+        } else if (UseCachedFramePointer(conf)) {
+            code.mov(code.r13, code.qword[code.r15 + offsetof(A64JitState, reg) + 29 * sizeof(u64)]);
         }
     };
 }

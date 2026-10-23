@@ -108,7 +108,11 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     }
 
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    const Xbyak::Reg64 vaddr = UseSharedMemoryAddress(ctx, inst, args[1]);
+#else
     const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
+#endif
     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm().getIdx() : ctx.reg_alloc.ScratchGpr().getIdx();
 
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
@@ -204,7 +208,11 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     }
 
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+    Xbyak::Reg64 vaddr = UseSharedMemoryAddress(ctx, inst, args[1]);
+#else
     Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
+#endif
     const int value_idx = bitsize == 128
                             ? ctx.reg_alloc.UseXmm(args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(args[2]).getIdx() : ctx.reg_alloc.UseGpr(args[2]).getIdx());

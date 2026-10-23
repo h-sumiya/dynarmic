@@ -164,8 +164,8 @@ template<>
     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
     const auto with_base = [&ctx](Xbyak::Reg64 address) -> Xbyak::RegExp {
         // A zero base is common for runtimes sharing native and guest pointers.
-        // Match the allocator and entry prelude: R13 is an ordinary temporary
-        // in this mode and must never be used as an implicit base register.
+        // Match the allocator and entry prelude: R13 can hold X29 or an
+        // allocated value and must never be used as an implicit memory base.
         if (ctx.conf.optimize_zero_base_fastmem && ctx.conf.fastmem_pointer == uintptr_t{0}) {
             return address;
         }

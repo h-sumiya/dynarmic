@@ -276,7 +276,7 @@ void EmitX64::EmitAddCycles(size_t cycles) {
     code.sub(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], static_cast<u32>(cycles));
 }
 
-Xbyak::Label EmitX64::EmitCond(IR::Cond cond, bool flags_are_live) {
+Xbyak::Label EmitX64::EmitCond(IR::Cond cond, bool flags_are_live, Xbyak::CodeGenerator::LabelType distance) {
     Xbyak::Label pass;
 
     if (!flags_are_live) {
@@ -290,46 +290,46 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond, bool flags_are_live) {
 
     switch (cond) {
     case IR::Cond::EQ:
-        code.jz(pass);
+        code.jz(pass, distance);
         break;
     case IR::Cond::NE:
-        code.jnz(pass);
+        code.jnz(pass, distance);
         break;
     case IR::Cond::CS:
-        code.jc(pass);
+        code.jc(pass, distance);
         break;
     case IR::Cond::CC:
-        code.jnc(pass);
+        code.jnc(pass, distance);
         break;
     case IR::Cond::MI:
-        code.js(pass);
+        code.js(pass, distance);
         break;
     case IR::Cond::PL:
-        code.jns(pass);
+        code.jns(pass, distance);
         break;
     case IR::Cond::VS:
-        code.jo(pass);
+        code.jo(pass, distance);
         break;
     case IR::Cond::VC:
-        code.jno(pass);
+        code.jno(pass, distance);
         break;
     case IR::Cond::HI:
-        code.ja(pass);
+        code.ja(pass, distance);
         break;
     case IR::Cond::LS:
-        code.jna(pass);
+        code.jna(pass, distance);
         break;
     case IR::Cond::GE:
-        code.jge(pass);
+        code.jge(pass, distance);
         break;
     case IR::Cond::LT:
-        code.jl(pass);
+        code.jl(pass, distance);
         break;
     case IR::Cond::GT:
-        code.jg(pass);
+        code.jg(pass, distance);
         break;
     case IR::Cond::LE:
-        code.jle(pass);
+        code.jle(pass, distance);
         break;
     default:
         ASSERT_MSG(false, "Unknown cond {}", static_cast<size_t>(cond));

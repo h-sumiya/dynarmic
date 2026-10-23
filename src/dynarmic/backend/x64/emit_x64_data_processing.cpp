@@ -1495,15 +1495,13 @@ void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
-    code.movzx(result.cvt32(), result.cvt8());
+    const Xbyak::Reg64 result = ctx.reg_alloc.UseZeroExtendedGpr(args[0]);
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
 void EmitX64::EmitZeroExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
-    code.movzx(result.cvt32(), result.cvt16());
+    const Xbyak::Reg64 result = ctx.reg_alloc.UseZeroExtendedGpr(args[0]);
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
@@ -1519,8 +1517,7 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
-    code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
+    const Xbyak::Reg64 result = ctx.reg_alloc.UseZeroExtendedGpr(args[0]);
     ctx.reg_alloc.DefineValue(inst, result);
 }
 

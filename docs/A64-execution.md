@@ -46,9 +46,9 @@ The execution thread copies up to 64 contiguous instruction words and at most
 64 additional words from bounded direct-successor windows. The worker reads
 only this immutable snapshot, never live guest memory or execution-thread
 callbacks. It forms a trace of at most 64 executed guest instructions, following
-captured unconditional branches, calls and resolved returns. One forward
-CBZ/CBNZ/TBZ/TBNZ fallthrough can join its successor through a native guard,
-ending at the successor's first branch. Cyclic traces retain their loop shape.
+captured unconditional branches, calls and resolved returns. Up to four forward
+CBZ/CBNZ/TBZ/TBNZ/B.cond fallthroughs can join successors through native guards;
+other branches end a guarded trace. Cyclic traces retain their loop shape.
 A visited target, remaining conditional or unresolved branch, system-state transition, snapshot boundary
 or instruction budget ends the trace. A missing continuation dispatches to the
 correct PC; it does not synthesize an instruction-fetch fault for code that was
@@ -98,14 +98,23 @@ native and index hits do not acquire that lock.
 Bounded traces remove internal branch dispatch and allow constant propagation
 and register get/set elimination across the joined instructions. Native
 guards preserve architectural state on their cold direct-link exits and use
-native TEST/BT conditions without a check-bit stack round trip. Arithmetic
-selection uses x86 signed 32-bit immediates when the full 64-bit value is
+native TEST/BT or NZCV conditions without a check-bit stack round trip. Eligible
+ADD/SUB conditions feed B.cond guards directly while preserving eager NZCV stores.
+Arithmetic selection uses x86 signed 32-bit immediates when the full 64-bit value is
 representable. The register allocator moves displaced live values to empty
 registers of the same class before using stack spills. Host-call preparation
 uses stack spills to preserve physical input and result registers retained by
 semantic fallback emitters.
 
-A conservative self-loop path keeps up to two guest GPRs in host registers.
+SP stays in a host register when page tables are disabled and memory callbacks
+preserve architectural state. The same configuration with 64-bit zero-base
+fastmem also caches X29. Writes update architectural state, and general
+callbacks and slow lookups reload the cached registers. Eligible ordinary
+memory accesses use these registers directly, including constant displacements.
+Known zero-extended 8/16/32-bit producers avoid redundant extension instructions.
+
+A conservative self-loop path keeps up to three guest GPRs in available host registers.
+Caching X29 reserves one of these host registers, leaving up to two loop values.
 External entries load them, self-edges retain them, and exits materialize them.
 Ordinary fastmem accesses use cold callback veneers to materialize retained
 registers before recovery. Exclusive accesses, general callbacks, architectural

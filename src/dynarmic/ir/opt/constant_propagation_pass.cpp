@@ -380,6 +380,11 @@ void FoldZeroExtendXToLong(IR::Inst& inst) {
 
 void ConstantPropagation(IR::Block& block) {
     for (auto& inst : block) {
+        // Flag pseudo operations require their original arithmetic or logical producer.
+        if (inst.MayGetNZCVFromOp() && inst.HasAssociatedPseudoOperation()) {
+            continue;
+        }
+
         const auto opcode = inst.GetOpcode();
 
         switch (opcode) {

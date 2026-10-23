@@ -115,7 +115,8 @@ void A64GetSetElimination(IR::Block& block, bool preserve_memory_fault_state, bo
         // prior stores without forgetting their SSA values or upper-bit facts.
         const auto opcode = inst->GetOpcode();
         const bool trace_guard = opcode == IR::Opcode::A64TraceCheckZero32 ||
-            opcode == IR::Opcode::A64TraceCheckZero64 || opcode == IR::Opcode::A64TraceCheckBit;
+            opcode == IR::Opcode::A64TraceCheckZero64 || opcode == IR::Opcode::A64TraceCheckBit ||
+            opcode == IR::Opcode::A64TraceCheckCond;
         const bool observer = inst->IsMemoryReadOrWrite() || inst->CausesCPUException() ||
             opcode == IR::Opcode::CallHostFunction || opcode == IR::Opcode::A64GetCNTPCT ||
             opcode == IR::Opcode::A64DataCacheOperationRaised ||
