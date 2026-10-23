@@ -180,6 +180,7 @@ private:
 
     BlockOfCode& code;
     size_t reserved_stack_space = 0;
+    bool preparing_host_call = false;
     void EmitMove(size_t bit_width, HostLoc to, HostLoc from);
     void EmitExchange(HostLoc a, HostLoc b);
 

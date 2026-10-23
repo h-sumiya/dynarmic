@@ -180,13 +180,21 @@ protected:
     bool shared_pc_in_r11 = false;
     bool shared_static_fpcr = false;
     CodePtr shared_block_entrypoint = nullptr;
-    // A pure shared loop can retain selected architectural GPRs across its
-    // self edge. External entries initialize them; all exits materialize them.
+    // A shared loop can retain selected architectural GPRs across its self
+    // edge. Entries initialize them; exits and memory callbacks materialize them.
     std::array<std::optional<HostLoc>, 31> shared_loop_registers{};
     bool shared_loop_flags = false;
     void PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_order);
     void EmitSharedLoopEntry();
     void EmitSharedLoopFlush();
+    const void* EmitSharedMemoryCallback(const void* callback);
+    // Terminal-only predicates stay in host flags instead of making a U1
+    // round trip through a register and the dispatcher stack.
+    IR::Inst* shared_check_bit_producer = nullptr;
+    IR::Cond shared_check_bit_condition = IR::Cond::AL;
+    bool shared_branch_flags = false;
+    void PrepareSharedBranch(IR::Block& block);
+    void EmitSharedCheckBit(A64EmitContext& ctx, IR::Inst* inst);
 
     void EmitRuntimeConfigPointer(Xbyak::Reg64 target);
     void EmitRuntimeReservationPointer(Xbyak::Reg64 target);

@@ -15,11 +15,15 @@
 #    define DYNARMIC_FASTMEM_RECORD(...) RegisterFastmemPatch(__VA_ARGS__)
 #    define DYNARMIC_RUNTIME_CONFIG(target) EmitRuntimeConfigPointer(target)
 #    define DYNARMIC_RUNTIME_RESERVATION(target) EmitRuntimeReservationPointer(target)
+#    define DYNARMIC_MEMORY_MATERIALIZE() EmitSharedLoopFlush()
+#    define DYNARMIC_MEMORY_VENEER(callback) EmitSharedMemoryCallback(mcl::bit_cast<const void*>(callback))
 #else
 #    define DYNARMIC_MEMORY_CALLBACK(member) Devirtualize<member>(conf.callbacks)
 #    define DYNARMIC_FASTMEM_RECORD(...) fastmem_patch_info.emplace(__VA_ARGS__)
 #    define DYNARMIC_RUNTIME_CONFIG(target) code.mov(target, reinterpret_cast<u64>(&conf))
 #    define DYNARMIC_RUNTIME_RESERVATION(target) code.mov(target, mcl::bit_cast<u64>(GetExclusiveMonitorReservation(conf.global_monitor, conf.processor_id)))
+#    define DYNARMIC_MEMORY_MATERIALIZE()
+#    define DYNARMIC_MEMORY_VENEER(callback) callback
 #endif
 
 namespace {
@@ -76,6 +80,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
+        DYNARMIC_MEMORY_MATERIALIZE();
         if constexpr (bitsize == 128) {
             ctx.reg_alloc.HostCall(nullptr, {}, args[1]);
             if (ordered) {
@@ -119,13 +124,14 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
-            code.call(wrapped_fn);
+            const auto callback_entry = DYNARMIC_MEMORY_VENEER(wrapped_fn);
+            code.call(callback_entry);
 
             DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
+                    mcl::bit_cast<u64>(callback_entry),
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
@@ -141,7 +147,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
-            code.call(wrapped_fn);
+            code.call(DYNARMIC_MEMORY_VENEER(wrapped_fn));
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
         });
@@ -163,6 +169,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
+        DYNARMIC_MEMORY_MATERIALIZE();
         if constexpr (bitsize == 128) {
             ctx.reg_alloc.Use(args[1], ABI_PARAM2);
             ctx.reg_alloc.Use(args[2], HostLoc::XMM1);
@@ -206,13 +213,14 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
-            code.call(wrapped_fn);
+            const auto callback_entry = DYNARMIC_MEMORY_VENEER(wrapped_fn);
+            code.call(callback_entry);
 
             DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
                     mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
+                    mcl::bit_cast<u64>(callback_entry),
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
@@ -228,7 +236,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
-            code.call(wrapped_fn);
+            code.call(DYNARMIC_MEMORY_VENEER(wrapped_fn));
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
         });
@@ -246,3 +254,5 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 #undef DYNARMIC_FASTMEM_RECORD
 #undef DYNARMIC_RUNTIME_CONFIG
 #undef DYNARMIC_RUNTIME_RESERVATION
+#undef DYNARMIC_MEMORY_MATERIALIZE
+#undef DYNARMIC_MEMORY_VENEER

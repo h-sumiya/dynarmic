@@ -14,6 +14,7 @@
 #include <fmt/ostream.h>
 #include <mcl/assert.hpp>
 #include <mcl/bit_cast.hpp>
+#include <mcl/scope_exit.hpp>
 #include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/abi.h"
@@ -437,6 +438,8 @@ void RegAlloc::HostCall(IR::Inst* result_def,
                         std::optional<Argument::copyable_reference> arg1,
                         std::optional<Argument::copyable_reference> arg2,
                         std::optional<Argument::copyable_reference> arg3) {
+    const bool previous_host_call = std::exchange(preparing_host_call, true);
+    SCOPE_EXIT { preparing_host_call = previous_host_call; };
     constexpr size_t args_count = 4;
     constexpr std::array<HostLoc, args_count> args_hostloc = {ABI_PARAM1, ABI_PARAM2, ABI_PARAM3, ABI_PARAM4};
     const std::array<std::optional<Argument::copyable_reference>, args_count> args = {arg0, arg1, arg2, arg3};
@@ -646,6 +649,23 @@ void RegAlloc::Exchange(HostLoc a, HostLoc b) {
 void RegAlloc::MoveOutOfTheWay(HostLoc reg) {
     ASSERT(!LocInfo(reg).IsLocked());
     if (!LocInfo(reg).IsEmpty()) {
+        // Fallback emitters keep physical argument/result registers across an
+        // ended allocation scope. Their untracked contents must survive call
+        // preparation, including in callee-saved registers.
+        if (preparing_host_call) {
+            SpillRegister(reg);
+            return;
+        }
+        // Destructive operands and fixed-register instructions often displace
+        // live values while other registers are empty. Move transfers every
+        // alias and its reference accounting without extending IR live ranges.
+        const auto& candidates = HostLocIsGPR(reg) ? gpr_order : xmm_order;
+        for (const auto destination : candidates) {
+            if (!LocInfo(destination).IsEmpty())
+                continue;
+            Move(destination, reg);
+            return;
+        }
         SpillRegister(reg);
     }
 }

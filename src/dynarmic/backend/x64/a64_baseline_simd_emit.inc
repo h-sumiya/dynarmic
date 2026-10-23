@@ -117,6 +117,76 @@ Emitter::Result Emitter::SimdInstruction(u32 instruction) {
         return Result::Continue;
     }
 
+    // FCSEL and half-precision general-register FMOV transfer raw bits.
+    // They never consult FPCR or FPSR and need no arithmetic helper boundary.
+    if ((i & 0xff200c00) == 0x1e200c00) {
+        const unsigned width = size == 3 ? 16 : 32 << size;
+        ReadVector(n, xmm0); ReadVector(m, xmm1);
+        movq(rbx, xmm0); movq(rcx, xmm1);
+        const unsigned condition = (i >> 12) & 15;
+        LoadFlags(condition); Select(condition, rcx, rbx);
+        movq(xmm0, rcx); isolate(xmm0, width / 8);
+        WriteVector(d, xmm0);
+        return Result::Continue;
+    }
+    if ((i & 0x7fe0fc00) == 0x1ee00000) {
+        const unsigned transfer = (i >> 16) & 31;
+        if (transfer == 6 || transfer == 7) {
+            const bool wide = i >> 31;
+            if (transfer == 7) {
+                Read(n, rax, wide); movzx(eax, ax); movq(xmm0, rax);
+                WriteVector(d, xmm0);
+            } else {
+                ReadVector(n, xmm0); movq(rax, xmm0); movzx(eax, ax);
+                Write(d, rax, wide);
+            }
+            return Result::Continue;
+        }
+    }
+
+    // Ordered S/D comparisons of normal numbers and signed zero have identical
+    // ARM/SSE results and cannot raise FP exceptions. Keep exceptional values
+    // in the exact helper so NaN signaling, FZ and enabled traps remain precise.
+    if ((i & 0xff20fc07) == 0x1e202000 && size <= 1) {
+        ReadVector(n, xmm0);
+        const bool with_zero = i & 8;
+        if (with_zero) pxor(xmm1, xmm1); else ReadVector(m, xmm1);
+        Xbyak::Label slow, done;
+        const auto ordered = [&](const Xbyak::Xmm& value) {
+            Xbyak::Label valid;
+            if (size == 0) {
+                movd(eax, value); add(eax, eax);
+                mov(ecx, eax); and_(ecx, 0xff000000u);
+                cmp(ecx, 0xff000000u); je(slow, T_NEAR);
+                test(ecx, ecx); jnz(valid, T_NEAR);
+                test(eax, eax); jnz(slow, T_NEAR);
+            } else {
+                movq(rax, value); add(rax, rax);
+                mov(rcx, rax); shr(rcx, 53);
+                cmp(ecx, 0x7ff); je(slow, T_NEAR);
+                test(ecx, ecx); jnz(valid, T_NEAR);
+                test(rax, rax); jnz(slow, T_NEAR);
+            }
+            L(valid);
+        };
+        ordered(xmm0); if (!with_zero) ordered(xmm1);
+        if (size == 0) ucomiss(xmm0, xmm1); else ucomisd(xmm0, xmm1);
+        mov(eax, NZCV::ToX64(0x20000000));
+        mov(ecx, NZCV::ToX64(0x80000000));
+        mov(edx, NZCV::ToX64(0x60000000));
+        cmovb(eax, ecx); cmove(eax, edx);
+        mov(dword[r15 + offsetof(A64JitState, cpsr_nzcv)], eax);
+        jmp(done, T_NEAR);
+        L(slow);
+        const auto saved_slots = slots;
+        const auto saved_vectors = vector_slots;
+        EmitHelper(offsetof(A64JitState, baseline_simd_instruction), instruction);
+        slots = saved_slots; vector_slots = saved_vectors;
+        ReloadAfterMemoryCallback();
+        L(done);
+        return Result::Continue;
+    }
+
     // Register copies, broadcasts, insertion, and extraction are independent
     // of FPSR. Every source is read before any aliasing destination is written.
     if (simd && (i & 0x8fe08400) == 0x0e000400) {

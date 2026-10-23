@@ -351,6 +351,58 @@ FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
 #include "dynarmic/backend/x64/a64_shared_loop.inc"
 
+void A64EmitX64::PrepareSharedBranch(IR::Block& block) {
+    shared_check_bit_producer = nullptr;
+    shared_check_bit_condition = IR::Cond::AL;
+    shared_branch_flags = false;
+    if (!shared_optimized || conf.enable_cycle_counting || conf.very_verbose_debugging_output)
+        return;
+
+    shared_branch_flags = SharedLoopNativeFlags(block);
+    const auto terminal = block.GetTerminal();
+    const auto* branch = boost::get<IR::Term::CheckBit>(&terminal);
+    const auto direct = [](const IR::Terminal& target) {
+        return boost::get<IR::Term::LinkBlock>(&target) || boost::get<IR::Term::LinkBlockFast>(&target);
+    };
+    if (!branch || !direct(branch->then_) || !direct(branch->else_) || block.empty())
+        return;
+    auto setter = std::prev(block.end());
+    if (setter->GetOpcode() != IR::Opcode::A64SetCheckBit || setter->GetArg(0).IsImmediate())
+        return;
+    auto* producer = setter->GetArg(0).GetInst();
+    if (setter == block.begin() || &*std::prev(setter) != producer || producer->UseCount() != 1)
+        return;
+    switch (producer->GetOpcode()) {
+    case IR::Opcode::IsZero32:
+    case IR::Opcode::IsZero64:
+        shared_check_bit_condition = IR::Cond::EQ;
+        break;
+    case IR::Opcode::TestBit:
+        if (!producer->GetArg(1).IsImmediate() || producer->GetArg(1).GetU8() >= 64)
+            return;
+        shared_check_bit_condition = IR::Cond::CS;
+        break;
+    default:
+        return;
+    }
+    // This is instruction selection after all IR passes. The producer now
+    // emits the terminal's native flags, so it needs no allocated U1 result.
+    shared_check_bit_producer = producer;
+    setter->Invalidate();
+    block.Instructions().erase(setter);
+}
+
+void A64EmitX64::EmitSharedCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const auto value = ctx.reg_alloc.UseGpr(args[0]);
+    if (inst->GetOpcode() == IR::Opcode::TestBit)
+        code.bt(value, args[1].GetImmediateU8());
+    else if (inst->GetOpcode() == IR::Opcode::IsZero32)
+        code.test(value.cvt32(), value.cvt32());
+    else
+        code.test(value, value);
+}
+
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (conf.very_verbose_debugging_output) {
         std::puts(IR::DumpBlock(block).c_str());
@@ -375,6 +427,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     }();
 
     PrepareSharedLoop(block, gpr_order);
+    PrepareSharedBranch(block);
     RegAlloc reg_alloc{code, std::move(gpr_order), any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
 
@@ -388,6 +441,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     for (auto iter = block.begin(); iter != block.end(); ++iter) {
         IR::Inst* inst = &*iter;
+
+        if (inst == shared_check_bit_producer) {
+            EmitSharedCheckBit(ctx, inst);
+            ctx.reg_alloc.EndOfAllocScope();
+            continue;
+        }
 
         // Call the relevant Emit* member function.
         switch (inst->GetOpcode()) {
@@ -1119,7 +1178,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor 
         EmitTerminal(terminal.then_, initial_location, is_single_step);
         break;
     default:
-        Xbyak::Label pass = EmitCond(terminal.if_, shared_loop_flags);
+        Xbyak::Label pass = EmitCond(terminal.if_, shared_loop_flags || shared_branch_flags);
         EmitTerminal(terminal.else_, initial_location, is_single_step);
         code.L(pass);
         EmitTerminal(terminal.then_, initial_location, is_single_step);
@@ -1128,6 +1187,13 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor 
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (shared_check_bit_producer) {
+        Xbyak::Label pass = EmitCond(shared_check_bit_condition, true);
+        EmitTerminal(terminal.else_, initial_location, is_single_step);
+        code.L(pass);
+        EmitTerminal(terminal.then_, initial_location, is_single_step);
+        return;
+    }
     Xbyak::Label fail;
     code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
     code.jz(fail);

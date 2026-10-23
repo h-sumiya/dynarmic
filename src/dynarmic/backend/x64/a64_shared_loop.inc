@@ -33,12 +33,29 @@ bool SharedLoopInstruction(const IR::Inst& inst) {
     case IR::Opcode::A64SetNZCV:
     case IR::Opcode::A64SetNZCVRaw:
     case IR::Opcode::A64SetCheckBit:
+    case IR::Opcode::A64GetS:
+    case IR::Opcode::A64GetD:
+    case IR::Opcode::A64GetQ:
+    case IR::Opcode::A64SetS:
+    case IR::Opcode::A64SetD:
+    case IR::Opcode::A64SetQ:
+    case IR::Opcode::A64ReadMemory8:
+    case IR::Opcode::A64ReadMemory16:
+    case IR::Opcode::A64ReadMemory32:
+    case IR::Opcode::A64ReadMemory64:
+    case IR::Opcode::A64ReadMemory128:
+    case IR::Opcode::A64WriteMemory8:
+    case IR::Opcode::A64WriteMemory16:
+    case IR::Opcode::A64WriteMemory32:
+    case IR::Opcode::A64WriteMemory64:
+    case IR::Opcode::A64WriteMemory128:
         return true;
     default:
         break;
     }
-    // A fault, callback, or observer of architectural state would require a
-    // materialization point inside the body. Do not delay its state stores.
+    // Ordinary data faults materialize retained registers in their cold
+    // callback veneers. Exclusive accesses and other architectural observers
+    // still require the general emitter's eager state stores.
     if (inst.MayHaveSideEffects() || inst.IsMemoryReadOrWrite() ||
         inst.ReadsFromCoreRegister() || inst.ReadsFromFPCR() || inst.ReadsFromFPSR())
         return false;
@@ -83,7 +100,7 @@ bool SharedLoopNativeFlags(IR::Block& block) {
     if (!setter || setter->GetArg(0).IsImmediate())
         return false;
     auto* flags = setter->GetArg(0).GetInst();
-    if (flags->GetOpcode() != IR::Opcode::GetNZCVFromOp)
+    if (flags->GetOpcode() != IR::Opcode::GetNZCVFromOp || flags->GetArg(0).IsImmediate())
         return false;
     auto* producer = flags->GetArg(0).GetInst();
     switch (producer->GetOpcode()) {
@@ -128,9 +145,11 @@ void A64EmitX64::PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_o
     if (!SharedLoopTerminal(block.GetTerminal(), block.Location(), self_edge) || !self_edge)
         return;
     std::array<unsigned, 31> reads{}, writes{};
+    bool memory_loop = false;
     for (const auto& inst : block) {
         if (!SharedLoopInstruction(inst))
             return;
+        memory_loop |= inst.IsMemoryReadOrWrite();
         switch (inst.GetOpcode()) {
         case IR::Opcode::A64GetW:
         case IR::Opcode::A64GetX:
@@ -144,6 +163,9 @@ void A64EmitX64::PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_o
             break;
         }
     }
+    if (memory_loop && (!conf.memory_callbacks_preserve_state ||
+        !conf.fastmem_pointer || !exception_handler.SupportsFastmem()))
+        return;
     // Reserve only two registers, leaving the general instruction selector
     // enough scratch registers even when an operation requires RAX/RCX/RDX.
     // These are not fixed scratch registers in scalar IR emission.
@@ -168,7 +190,7 @@ void A64EmitX64::PrepareSharedLoop(IR::Block& block, std::vector<HostLoc>& gpr_o
     }
     // The cycle accounting emitted after the body changes host flags. Keep
     // that configuration on the ordinary condition/materialization path.
-    if (!conf.enable_cycle_counting && SharedLoopNativeFlags(block)) {
+    if (!memory_loop && !conf.enable_cycle_counting && SharedLoopNativeFlags(block)) {
         const auto available = std::find(gpr_order.begin(), gpr_order.end(), HostLoc::R10);
         if (available != gpr_order.end()) {
             gpr_order.erase(available);
@@ -196,4 +218,20 @@ void A64EmitX64::EmitSharedLoopFlush() {
     }
     if (shared_loop_flags)
         code.mov(dword[r15 + offsetof(A64JitState, cpsr_nzcv)], r10d);
+}
+
+const void* A64EmitX64::EmitSharedMemoryCallback(const void* callback) {
+    if (std::none_of(shared_loop_registers.begin(), shared_loop_registers.end(),
+                     [](const auto& reg) { return reg.has_value(); }))
+        return callback;
+    // Both native faults and explicit address fallbacks call this veneer with
+    // the original native register values. Tail-call the ABI-preserving
+    // wrapper so its stack layout and the fault handler's fake return match.
+    Xbyak::Label continuation;
+    code.jmp(continuation, code.T_NEAR);
+    const void* entry = code.getCurr();
+    EmitSharedLoopFlush();
+    code.jmp(callback);
+    code.L(continuation);
+    return entry;
 }

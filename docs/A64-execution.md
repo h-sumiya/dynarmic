@@ -96,23 +96,30 @@ native and index hits do not acquire that lock.
 Bounded traces remove internal branch dispatch and allow constant propagation
 and register get/set elimination across the joined instructions. Arithmetic
 selection uses x86 signed 32-bit immediates when the full 64-bit value is
-representable. The register allocator spills displaced live values to the stack.
+representable. The register allocator moves displaced live values to empty
+registers of the same class before using stack spills. Host-call preparation
+uses stack spills to preserve physical input and result registers retained by
+semantic fallback emitters.
 
-A conservative pure self-loop path keeps up to two guest GPRs in host registers.
-External entries load them, self-edges retain them, and every exit materializes
-them. Eligible final ADD/SUB flag producers can retain packed NZCV and use the
-live native condition flags at the terminal. Memory access, callbacks,
-architectural observers, incompatible flag reads, verbose tracing and
-single-step exclude this path. Cycle-counted blocks use the ordinary condition
-materialization path. Other blocks retain the general emitter.
+A conservative self-loop path keeps up to two guest GPRs in host registers.
+External entries load them, self-edges retain them, and exits materialize them.
+Ordinary fastmem accesses use cold callback veneers to materialize retained
+registers before recovery. Exclusive accesses, general callbacks, architectural
+observers, verbose tracing and single-step exclude this path. Pure arithmetic
+loops can also retain packed NZCV. Eligible final ADD/SUB, zero and bit tests
+use native condition flags at direct terminals, including outside self-loops.
+Cycle-counted blocks use the ordinary condition materialization path.
 
 When `check_halt_on_memory_access` is enabled, register get/set elimination
 preserves architectural state at memory accesses and other observation points.
 Faulting reads do not commit their destination register. Ordinary callback
 returns fall through their memory-abort checks; the exceptional PC update and
 exit are emitted in a cold tail. The baseline compiler
-uses four GPR and four SIMD slots and semantic helpers for complex instructions;
-recovery veneers preserve exact guest state at memory faults in both tiers.
+uses four GPR and four SIMD slots and semantic helpers for complex instructions.
+Scalar S/D comparisons of normal values and signed zero use native SSE;
+exceptional values use the semantic helper. FP conditional selects and
+general-register transfers preserve raw bits without a helper boundary.
+Recovery veneers preserve exact guest state at memory faults in both tiers.
 
 ## Invalidation and reclamation
 
