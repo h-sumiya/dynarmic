@@ -106,6 +106,16 @@ protected:
     std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
     void GenFastmemFallbacks();
 
+    struct DeferredRegister {
+        u8 index;
+        bool word;
+        RegAlloc::ValueSnapshot value;
+    };
+    void PrepareDeferredState(IR::Block& block);
+    std::vector<DeferredRegister> CaptureDeferredState(A64EmitContext& ctx, IR::Inst* inst);
+    std::pair<u64, u64> EmitDeferredMemoryFallback(A64EmitContext& ctx, IR::Inst* inst,
+        const void* wrapped, Xbyak::Label& end, const std::vector<DeferredRegister>& state);
+
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;

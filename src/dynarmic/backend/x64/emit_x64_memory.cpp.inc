@@ -115,23 +115,30 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+        const auto deferred_state = CaptureDeferredState(ctx, inst);
+#endif
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+            const auto [resume, callback_entry] = EmitDeferredMemoryFallback(ctx, inst, wrapped_fn, *end, deferred_state);
+#else
             code.call(wrapped_fn);
-
+            const auto resume = mcl::bit_cast<u64>(code.getCurr());
+            const auto callback_entry = mcl::bit_cast<u64>(wrapped_fn);
+            EmitCheckMemoryAbort(ctx, inst, end.get());
+            code.jmp(*end, code.T_NEAR);
+#endif
             DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
+                    resume,
+                    callback_entry,
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
-
-            EmitCheckMemoryAbort(ctx, inst, end.get());
-            code.jmp(*end, code.T_NEAR);
         });
     } else {
         // Use page table
@@ -202,23 +209,30 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling;
         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+        const auto deferred_state = CaptureDeferredState(ctx, inst);
+#endif
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+#ifdef DYNARMIC_A64_SHARED_EMITTER
+            const auto [resume, callback_entry] = EmitDeferredMemoryFallback(ctx, inst, wrapped_fn, *end, deferred_state);
+#else
             code.call(wrapped_fn);
-
+            const auto resume = mcl::bit_cast<u64>(code.getCurr());
+            const auto callback_entry = mcl::bit_cast<u64>(wrapped_fn);
+            EmitCheckMemoryAbort(ctx, inst, end.get());
+            code.jmp(*end, code.T_NEAR);
+#endif
             DYNARMIC_FASTMEM_RECORD(
                 mcl::bit_cast<u64>(location),
                 FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
+                    resume,
+                    callback_entry,
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
-
-            EmitCheckMemoryAbort(ctx, inst, end.get());
-            code.jmp(*end, code.T_NEAR);
         });
     } else {
         // Use page table
