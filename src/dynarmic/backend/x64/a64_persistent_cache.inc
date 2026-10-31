@@ -61,6 +61,12 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
     const auto data = source.code.PersistentData();
     saved.data.assign(data.begin(), data.end());
     saved.body.assign(source.code.getCode() + saved.prelude, source.code.getCode() + body_end);
+    std::vector<const BlockOfCode::Relocation*> relocations;
+    relocations.reserve(source.code.Relocations().size());
+    for (const auto& relocation : source.code.Relocations()) relocations.push_back(&relocation);
+    std::stable_sort(relocations.begin(), relocations.end(), [](const auto* left, const auto* right) {
+        return left->offset < right->offset;
+    });
     const auto host_reference = [&](u64 address) {
         for (std::size_t index = 0; index < saved.hosts.size(); ++index) {
             const auto& known = saved.hosts[index];
@@ -90,8 +96,10 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
             block.entry = entry; block.size = record->host_size;
             for (const auto& [pc, word] : record->source_words)
                 block.words.push_back({GuestReference(saved, pc, pc, false), word});
-            for (const auto& relocation : source.code.Relocations()) {
-                if (relocation.offset < entry || relocation.offset - entry >= record->host_size) continue;
+            auto relocation_it = std::lower_bound(relocations.begin(), relocations.end(), entry,
+                [](const auto* relocation, u64 offset) { return relocation->offset < offset; });
+            for (; relocation_it != relocations.end() && (*relocation_it)->offset - entry < record->host_size; ++relocation_it) {
+                const auto& relocation = **relocation_it;
                 Persistent::Relocation item;
                 item.offset = relocation.offset; item.kind = static_cast<std::uint8_t>(relocation.kind);
                 switch (relocation.kind) {
@@ -116,10 +124,15 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
         }
     }
     if (saved.blocks.empty()) return std::nullopt;
+    std::sort(saved.blocks.begin(), saved.blocks.end(), [](const auto& left, const auto& right) {
+        return left.entry < right.entry;
+    });
     const auto owner = [&](u64 offset) -> const Persistent::Block* {
-        for (const auto& block : saved.blocks)
-            if (offset >= block.entry && offset - block.entry < block.size) return &block;
-        return nullptr;
+        auto block = std::upper_bound(saved.blocks.begin(), saved.blocks.end(), offset,
+            [](u64 value, const auto& candidate) { return value < candidate.entry; });
+        if (block == saved.blocks.begin()) return nullptr;
+        --block;
+        return offset - block->entry < block->size ? &*block : nullptr;
     };
     for (const auto& link : source.links) {
         const auto cell = reinterpret_cast<u64>(link.cell) - base;
@@ -226,6 +239,15 @@ void SharedCodeCache::Impl::LoadPersistent() {
                 };
                 std::vector<Persistent::HostImage> hosts;
                 for (const auto& host : saved.hosts) hosts.push_back(Persistent::ResolveHostImage(host));
+                std::vector<const Persistent::Link*> link_index;
+                link_index.reserve(saved.links.size());
+                for (const auto& link : saved.links) link_index.push_back(&link);
+                std::sort(link_index.begin(), link_index.end(), [](const auto* left, const auto* right) {
+                    return left->fallback < right->fallback;
+                });
+                std::stable_sort(saved.relocations.begin(), saved.relocations.end(), [](const auto& left, const auto& right) {
+                    return left.offset < right.offset;
+                });
                 std::vector<std::unique_ptr<SharedPublishedBlock>> records;
                 std::vector<std::pair<u64, u64>> selected;
                 bool deferred = false;
@@ -252,11 +274,14 @@ void SharedCodeCache::Impl::LoadPersistent() {
                         // A ready body can still have a direct-link cell whose
                         // target image is loaded later. Defer that body while
                         // restoring independent blocks from the same file.
-                        for (const auto& link : saved.links)
-                            if (link.fallback >= block.entry && link.fallback - block.entry < block.size)
-                                (void)resolve(link.location, true);
-                        for (const auto& relocation : saved.relocations) {
-                            if (relocation.offset < block.entry || relocation.offset - block.entry >= block.size) continue;
+                        auto link_it = std::lower_bound(link_index.begin(), link_index.end(), block.entry,
+                            [](const auto* link, u64 offset) { return link->fallback < offset; });
+                        for (; link_it != link_index.end() && (*link_it)->fallback - block.entry < block.size; ++link_it)
+                            (void)resolve((*link_it)->location, true);
+                        auto relocation_it = std::lower_bound(saved.relocations.begin(), saved.relocations.end(), block.entry,
+                            [](const auto& relocation, u64 offset) { return relocation.offset < offset; });
+                        for (; relocation_it != saved.relocations.end() && relocation_it->offset - block.entry < block.size; ++relocation_it) {
+                            const auto& relocation = *relocation_it;
                             if (block.size - (relocation.offset - block.entry) < sizeof(u64))
                                 throw std::runtime_error("Invalid persistent A64 relocation bounds");
                             u64 value = 0;
@@ -303,8 +328,18 @@ void SharedCodeCache::Impl::LoadPersistent() {
                     if (!deferred) restored_files.insert(filename);
                     continue;
                 }
+                std::sort(selected.begin(), selected.end());
+                std::size_t merged = 0;
+                for (const auto& range : selected) {
+                    if (merged && range.first <= selected[merged - 1].second)
+                        selected[merged - 1].second = std::max(selected[merged - 1].second, range.second);
+                    else selected[merged++] = range;
+                }
+                selected.resize(merged);
                 const auto selected_offset = [&](u64 offset) {
-                    return std::any_of(selected.begin(), selected.end(), [&](const auto& range) { return offset >= range.first && offset < range.second; });
+                    auto range = std::upper_bound(selected.begin(), selected.end(), offset,
+                        [](u64 value, const auto& candidate) { return value < candidate.first; });
+                    return range != selected.begin() && offset < std::prev(range)->second;
                 };
                 std::vector<Persistent::Link> links;
                 for (auto link : saved.links) {
