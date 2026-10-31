@@ -21,26 +21,30 @@ std::uint64_t SharedCodeCache::Impl::PersistentContract() const {
 }
 
 Persistent::Reference SharedCodeCache::Impl::GuestReference(Persistent::Region& saved,
+        std::unordered_map<std::string, std::uint32_t>& image_indices,
         std::uint64_t value, std::uint64_t origin, bool location, bool pc) const {
     const auto address = location ? LocationDescriptor{IR::LocationDescriptor{value}}.PC() : value;
-    const auto contains = [](const auto& image, auto pc) {
-        return pc >= image.address && pc - image.address < image.size;
+    const auto image_at = [&](u64 pc) -> const PersistentImage* {
+        auto found = std::upper_bound(persistent_image_order.begin(), persistent_image_order.end(), pc,
+            [&](u64 address, auto index) { return address < persistent_images[index].address; });
+        if (found == persistent_image_order.begin()) return nullptr;
+        const auto& image = persistent_images[*std::prev(found)];
+        return pc - image.address < image.size ? &image : nullptr;
     };
     // An ADR/ADRP expression follows its origin image's relocation, including
     // addends outside that image. Dispatch PCs identify the destination image.
     const bool destination = location || pc;
-    auto found = std::find_if(persistent_images.begin(), persistent_images.end(),
-        [&](const auto& image) { return contains(image, destination ? address : origin); });
-    if (found == persistent_images.end())
-        found = std::find_if(persistent_images.begin(), persistent_images.end(),
-            [&](const auto& image) { return contains(image, destination ? origin : address); });
-    if (found == persistent_images.end()) throw std::runtime_error("A64 guest address has no stable image");
-    auto identity = std::find(saved.images.begin(), saved.images.end(), found->identity);
-    if (identity == saved.images.end()) {
+    const auto* found = image_at(destination ? address : origin);
+    if (!found) found = image_at(destination ? origin : address);
+    if (!found) throw std::runtime_error("A64 guest address has no stable image");
+    auto identity = image_indices.find(found->identity);
+    std::uint32_t index;
+    if (identity == image_indices.end()) {
+        index = static_cast<std::uint32_t>(saved.images.size());
         saved.images.push_back(found->identity);
-        identity = std::prev(saved.images.end());
-    }
-    return {static_cast<std::uint32_t>(identity - saved.images.begin()), address - found->address,
+        image_indices.emplace(found->identity, index);
+    } else index = identity->second;
+    return {index, address - found->address,
             location ? value & ~LocationDescriptor::pc_mask : 0};
 }
 
@@ -49,7 +53,17 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
         source.saved_records == source.records.size() || !compile_config ||
         compile_config->very_verbose_debugging_output)
         return std::nullopt;
+    if (persistent_image_order.size() != persistent_images.size()) {
+        persistent_image_order.clear();
+        persistent_image_order.reserve(persistent_images.size());
+        for (std::size_t i = 0; i < persistent_images.size(); ++i) persistent_image_order.push_back(i);
+        std::sort(persistent_image_order.begin(), persistent_image_order.end(), [&](auto left, auto right) {
+            return persistent_images[left].address < persistent_images[right].address;
+        });
+    }
     Persistent::Region saved;
+    std::unordered_map<std::string, std::uint32_t> image_indices;
+    image_indices.reserve(persistent_images.size());
     saved.runtime_identity = Persistent::RuntimeIdentity();
     saved.contract = PersistentContract();
     saved.features = source.code.HostFeatures();
@@ -92,10 +106,10 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
         try {
             Persistent::Block block;
             const auto origin = LocationDescriptor{IR::LocationDescriptor{record->location}}.PC();
-            block.location = GuestReference(saved, record->location, origin, true);
+            block.location = GuestReference(saved, image_indices, record->location, origin, true);
             block.entry = entry; block.size = record->host_size;
             for (const auto& [pc, word] : record->source_words)
-                block.words.push_back({GuestReference(saved, pc, pc, false), word});
+                block.words.push_back({GuestReference(saved, image_indices, pc, pc, false), word});
             auto relocation_it = std::lower_bound(relocations.begin(), relocations.end(), entry,
                 [](const auto* relocation, u64 offset) { return relocation->offset < offset; });
             for (; relocation_it != relocations.end() && (*relocation_it)->offset - entry < record->host_size; ++relocation_it) {
@@ -107,10 +121,10 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
                     item.target = host_reference(relocation.value); break;
                 case BlockOfCode::RelocationKind::GuestAddress:
                 case BlockOfCode::RelocationKind::GuestLocation:
-                    item.target = GuestReference(saved, relocation.value, relocation.origin,
+                    item.target = GuestReference(saved, image_indices, relocation.value, relocation.origin,
                         relocation.kind == BlockOfCode::RelocationKind::GuestLocation); break;
                 case BlockOfCode::RelocationKind::GuestPC:
-                    item.target = GuestReference(saved, relocation.value, relocation.origin, false, true); break;
+                    item.target = GuestReference(saved, image_indices, relocation.value, relocation.origin, false, true); break;
                 case BlockOfCode::RelocationKind::GlobalMonitor:
                 case BlockOfCode::RelocationKind::ExclusiveBuckets:
                     break;
@@ -119,6 +133,7 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
             }
             saved.blocks.push_back(std::move(block));
         } catch (...) {
+            for (auto i = image_count; i < saved.images.size(); ++i) image_indices.erase(saved.images[i]);
             saved.images.resize(image_count); saved.hosts.resize(host_count);
             saved.relocations.resize(relocation_count);
         }
@@ -143,11 +158,10 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
         const auto fallback = reinterpret_cast<u64>(link.fallback) - base;
         const auto* block = owner(fallback);
         if (!block) continue;
-        const auto identity = saved.images.at(block->location.image);
-        const auto image = std::find_if(persistent_images.begin(), persistent_images.end(),
-            [&](const auto& candidate) { return candidate.identity == identity; });
-        const auto origin = image->address + block->location.offset;
-        saved.links.push_back({GuestReference(saved, link.target, origin, true), cell, fallback});
+        const auto& identity = saved.images.at(block->location.image);
+        const auto& image = persistent_images.at(persistent_image_index.at(identity));
+        const auto origin = image.address + block->location.offset;
+        saved.links.push_back({GuestReference(saved, image_indices, link.target, origin, true), cell, fallback});
     }
     for (const auto& fault : source.emitter.PersistentFaults())
         if (owner(fault.rip)) saved.faults.push_back({fault.rip, fault.resume, fault.callback});
@@ -155,31 +169,85 @@ std::optional<Persistent::Region> SharedCodeCache::Impl::SnapshotPersistent(Shar
     return saved;
 }
 
-void SharedCodeCache::Impl::SavePersistent() {
+void SharedCodeCache::Impl::SavePersistent(bool force) {
     if (config.persistent_directory.empty()) return;
     try {
-        std::lock_guard io(persistence_io);
-        std::vector<Persistent::Region> snapshots;
+        // A v3 reader retains its opened file snapshot across atomic rename
+        // and trimming. Serialization and disk writes never hold the restore
+        // mutex, so executing guest threads cannot queue behind a save.
+        std::lock_guard writer(persistence_save);
+        std::size_t budget;
         {
             std::lock_guard lock(mutex);
-            for (auto& region : regions) {
-                try {
-                    if (auto saved = SnapshotPersistent(*region)) snapshots.push_back(std::move(*saved));
-                } catch (...) { ++statistics.persistence_failures; }
-            }
+            budget = regions.size();
         }
-        for (const auto& saved : snapshots) {
+        std::unordered_set<std::uintptr_t> visited;
+        visited.reserve(budget);
+        bool wrote = false;
+        while (budget--) {
+            std::optional<Persistent::Region> saved;
+            std::string filename;
+            bool selected = false;
+            {
+                std::lock_guard lock(mutex);
+                const auto started = std::chrono::steady_clock::now();
+                for (auto& region : regions) {
+                    if (region->restored || region->retired || region->building || region->records.empty() ||
+                        region->saved_records == region->records.size() ||
+                        visited.contains(reinterpret_cast<std::uintptr_t>(region.get())) ||
+                        (!force && !region->sealed && started - region->last_checkpoint < std::chrono::seconds(5)))
+                        continue;
+                    visited.insert(reinterpret_cast<std::uintptr_t>(region.get()));
+                    selected = true;
+                    try {
+                        saved = SnapshotPersistent(*region);
+                        if (saved) {
+                            if (region->save_file.empty()) region->save_file = Persistent::Key(*saved) + ".a64c";
+                            filename = region->save_file;
+                        }
+                    } catch (...) { ++statistics.persistence_failures; }
+                    // Unrepresentable records must not prevent reclamation.
+                    // A captured snapshot owns every byte before retirement.
+                    region->saved_records = region->records.size();
+                    region->last_checkpoint = started;
+                    break;
+                }
+                const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+                statistics.snapshot_nanoseconds += elapsed;
+                statistics.snapshot_max_nanoseconds = std::max(statistics.snapshot_max_nanoseconds, elapsed);
+            }
+            if (!selected) break;
+            changed.notify_all();
+            if (!saved) continue;
+            const auto started = std::chrono::steady_clock::now();
             try {
-                const auto path = config.persistent_directory / (Persistent::Key(saved) + ".a64c");
-                Persistent::Write(path, saved);
+                const auto path = config.persistent_directory / filename;
+                Persistent::Write(path, *saved);
                 const auto bytes = std::filesystem::file_size(path);
                 std::lock_guard lock(mutex);
                 ++statistics.persisted_regions; statistics.persistent_bytes += bytes;
+                wrote = true;
             } catch (...) {
                 std::lock_guard lock(mutex); ++statistics.persistence_failures;
             }
+            const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+            {
+                std::lock_guard lock(mutex);
+                statistics.persistent_write_nanoseconds += elapsed;
+                statistics.persistent_write_max_nanoseconds = std::max(statistics.persistent_write_max_nanoseconds, elapsed);
+            }
         }
-        if (!snapshots.empty()) Persistent::Trim(config.persistent_directory, config.persistent_capacity_bytes);
+        if (wrote) {
+            const auto started = std::chrono::steady_clock::now();
+            Persistent::Trim(config.persistent_directory, config.persistent_capacity_bytes);
+            const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+            std::lock_guard lock(mutex);
+            statistics.persistent_write_nanoseconds += elapsed;
+            statistics.persistent_write_max_nanoseconds = std::max(statistics.persistent_write_max_nanoseconds, elapsed);
+        }
     } catch (...) {
         std::lock_guard lock(mutex); ++statistics.persistence_failures;
     }
@@ -188,9 +256,11 @@ void SharedCodeCache::Impl::SavePersistent() {
 void SharedCodeCache::Impl::PersistenceWorker() {
     for (;;) {
         std::unique_lock lock(mutex);
-        if (changed.wait_for(lock, std::chrono::milliseconds(250), [&] { return stopping; })) return;
+        changed.wait_for(lock, std::chrono::milliseconds(250), [&] { return stopping || persistence_requested; });
+        if (stopping) return;
+        persistence_requested = false;
         lock.unlock();
-        SavePersistent();
+        SavePersistent(false);
     }
 }
 
@@ -254,11 +324,20 @@ void SharedCodeCache::Impl::RestorePersistentBlock(std::size_t file_ordinal, std
     const auto started = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         std::lock_guard lock(mutex);
-        statistics.restore_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started).count();
+        const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        statistics.restore_nanoseconds += elapsed;
+        statistics.restore_max_nanoseconds = std::max(statistics.restore_max_nanoseconds, elapsed);
     };
     try {
         std::lock_guard io(persistence_io);
+        const auto waited = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        {
+            std::lock_guard lock(mutex);
+            statistics.restore_wait_nanoseconds += waited;
+            statistics.restore_wait_max_nanoseconds = std::max(statistics.restore_wait_max_nanoseconds, waited);
+        }
         const auto& file = persistent_index_files.at(file_ordinal);
         const auto& filename = file.filename;
         const auto& saved = file.saved;

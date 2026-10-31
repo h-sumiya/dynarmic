@@ -121,8 +121,10 @@ struct SharedRegion {
     bool retire_requested = false;
     std::uint64_t retire_epoch = 0;
     std::size_t saved_records = 0;
+    std::chrono::steady_clock::time_point last_checkpoint = std::chrono::steady_clock::now();
     bool restored = false;
     std::string persistent_file;
+    std::string save_file;
 };
 
 } // namespace
@@ -397,6 +399,10 @@ struct SharedCodeCache::Impl {
         if (current && (current->sealed || current->code.SpaceRemaining() < emission_reserve)) {
             current->sealed = true;
             current = nullptr;
+            if (!config.persistent_directory.empty()) {
+                persistence_requested = true;
+                changed.notify_all();
+            }
         }
         if (current)
             return current;
@@ -410,8 +416,15 @@ struct SharedCodeCache::Impl {
             // FIFO region retirement clears incoming mutable link cells and
             // removes publication before advancing the reader epoch. Existing
             // readers retain the victim until their next dispatch safepoint.
-            const auto victim = std::find_if(regions.begin(), regions.end(), [](const auto& region) {
-                return region->sealed && !region->building && !region->retired;
+            const auto victim = std::find_if(regions.begin(), regions.end(), [&](const auto& region) {
+                if (!region->sealed || region->building || region->retired) return false;
+                if (!config.persistent_directory.empty() && !region->restored &&
+                    region->saved_records != region->records.size()) {
+                    persistence_requested = true;
+                    changed.notify_all();
+                    return false;
+                }
+                return true;
             });
             if (victim != regions.end())
                 Retire(**victim);
@@ -850,14 +863,17 @@ struct SharedCodeCache::Impl {
 
     const SharedCodeCacheConfig config;
     std::uint64_t PersistentContract() const;
-    Persistent::Reference GuestReference(Persistent::Region&, std::uint64_t value,
-                                        std::uint64_t origin, bool location, bool pc = false) const;
+    Persistent::Reference GuestReference(Persistent::Region&,
+                                        std::unordered_map<std::string, std::uint32_t>& image_indices,
+                                        std::uint64_t value, std::uint64_t origin, bool location, bool pc = false) const;
     std::optional<Persistent::Region> SnapshotPersistent(SharedRegion&);
-    void SavePersistent();
+    void SavePersistent(bool force = true);
     void LoadPersistent();
     void RestorePersistentBlock(std::size_t file, std::size_t block);
     void PersistenceWorker();
     std::mutex persistence_io;
+    std::mutex persistence_save;
+    bool persistence_requested = false;
     std::thread persistence_worker;
     std::vector<PersistentImage> persistent_images;
     std::unordered_map<std::string, std::size_t> persistent_image_index;
