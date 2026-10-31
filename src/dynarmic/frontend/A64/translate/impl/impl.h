@@ -19,7 +19,7 @@ struct TranslatorVisitor final {
     using instruction_return_type = bool;
 
     explicit TranslatorVisitor(IR::Block& block, LocationDescriptor descriptor, TranslationOptions options)
-            : ir(block, descriptor), options(std::move(options)) {}
+            : ir(block, descriptor, options.relocatable_addresses), options(std::move(options)) {}
 
     A64::IREmitter ir;
     TranslationOptions options;

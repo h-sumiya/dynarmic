@@ -30,6 +30,8 @@ public:
     // Separate slots in the near data pool. They are never deduplicated or
     // referenced by literal constant users, and remain source-region owned.
     void* AllocateMutableData(size_t bytes);
+    std::span<const u8> UsedData() const;
+    void RestoreData(std::span<const u8> data, std::size_t prelude_size);
 
 private:
     static constexpr size_t align_size = 16;  // bytes

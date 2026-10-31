@@ -90,7 +90,7 @@ bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
 
 bool TranslatorVisitor::ISB(Imm<4> /*CRm*/) {
     ir.InstructionSynchronizationBarrier();
-    ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+    ir.SetPC(ir.GuestAddress(ir.current_location->PC() + 4));
     ir.SetTerm(IR::Term::ReturnToDispatch{});
     return false;
 }
@@ -100,7 +100,7 @@ bool TranslatorVisitor::MSR_reg(Imm<1> o0, Imm<3> op1, Imm<4> CRn, Imm<4> CRm, I
     switch (sys_reg) {
     case SystemRegisterEncoding::FPCR:
         ir.SetFPCR(X(32, Rt));
-        ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+        ir.SetPC(ir.GuestAddress(ir.current_location->PC() + 4));
         ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     case SystemRegisterEncoding::FPSR:

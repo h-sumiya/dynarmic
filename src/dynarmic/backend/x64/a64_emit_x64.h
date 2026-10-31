@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <tuple>
 #include <vector>
 
@@ -69,6 +70,9 @@ public:
     const void* GetBaselineReturn() const { return baseline_return; }
     const void* GetBaselineHotReturn() const { return baseline_hot_return; }
     const void* GetSharedIndirectLookup() const { return shared_indirect_lookup; }
+    struct PersistentFault { u64 rip, resume, callback; };
+    std::vector<PersistentFault> PersistentFaults() const;
+    void RestorePersistentFaults(std::span<const PersistentFault> faults);
 
     void ClearCache() override;
 
@@ -191,6 +195,7 @@ protected:
     bool shared_pc_in_r11 = false;
     bool shared_static_fpcr = false;
     CodePtr shared_block_entrypoint = nullptr;
+    u64 shared_block_origin = 0;
     // A shared loop can retain selected architectural GPRs across its self
     // edge. Entries initialize them; exits and memory callbacks materialize them.
     std::array<std::optional<HostLoc>, 31> shared_loop_registers{};

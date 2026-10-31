@@ -349,6 +349,8 @@ if ("x86_64" IN_LIST ARCHITECTURE)
             backend/x64/a64_interface.cpp
             backend/x64/a64_shared_code_cache.cpp
             backend/x64/a64_shared_code_cache.h
+            backend/x64/a64_persistent_cache.cpp
+            backend/x64/a64_persistent_cache.h
             backend/x64/a64_runtime_callback.h
             backend/x64/a64_jitstate.cpp
             backend/x64/a64_jitstate.h

@@ -48,6 +48,8 @@ struct SharedPublishedBlock {
     // contiguous guest_start/end compatibility form. Neither the vector nor
     // its addresses may change after it is indexed for publication.
     std::vector<SharedGuestRange> guest_ranges{};
+    std::size_t host_size = 0;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> source_words;
 };
 static_assert(offsetof(SharedPublishedBlock, entrypoint) == 8);
 static_assert(std::atomic<const SharedPublishedBlock*>::is_always_lock_free);

@@ -141,7 +141,7 @@ void A64EmitX64::PrepareSharedDispatch(IR::Block& block) {
 }
 
 void A64EmitX64::EmitSharedLinkFallback(IR::LocationDescriptor target) {
-    code.mov(rax, A64::LocationDescriptor{target}.PC());
+    code.MovGuestPC(rax, A64::LocationDescriptor{target}.PC(), shared_block_origin);
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
     // A return-link cell can enter this veneer from a different block. Its
     // caller has already materialized guest registers: do not emit a
@@ -189,7 +189,7 @@ void A64EmitX64::EmitSharedLink(IR::LocationDescriptor next,
         EmitSharedLinkFallback(next);
         return;
     }
-    code.mov(rax, A64::LocationDescriptor{next}.PC());
+    code.MovGuestPC(rax, A64::LocationDescriptor{next}.PC(), shared_block_origin);
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
     EmitSharedDispatch();
 }
@@ -354,6 +354,23 @@ FakeCall A64EmitX64::SharedFastmemCallback(u64 rip) const {
     return {};
 }
 
+std::vector<A64EmitX64::PersistentFault> A64EmitX64::PersistentFaults() const {
+    std::vector<PersistentFault> result;
+    const auto base = reinterpret_cast<u64>(code.getCode());
+    result.reserve(shared_fastmem_records.size());
+    for (const auto& fault : shared_fastmem_records)
+        result.push_back({fault->rip - base, fault->info.resume_rip ? fault->info.resume_rip - base : 0,
+                          fault->info.callback - base});
+    return result;
+}
+
+void A64EmitX64::RestorePersistentFaults(std::span<const PersistentFault> faults) {
+    const auto base = reinterpret_cast<u64>(code.getCode());
+    for (const auto& fault : faults)
+        RegisterFastmemPatch(base + fault.rip,
+            {fault.resume ? base + fault.resume : 0, base + fault.callback, {IR::LocationDescriptor{0}, 0}, false});
+}
+
 #include "dynarmic/backend/x64/a64_baseline_emit.inc"
 #include "dynarmic/backend/x64/a64_shared_loop.inc"
 #include "dynarmic/backend/x64/a64_memory_address.inc"
@@ -474,6 +491,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     };
 
     PrepareSharedDispatch(block);
+    shared_block_origin = A64::LocationDescriptor{block.Location()}.PC();
     std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
         if (conf.page_table || UseCachedSP()) {
@@ -695,9 +713,9 @@ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
         const Xbyak::Reg64 index = ctx.reg_alloc.ScratchGpr();
         const Xbyak::Reg64 value = ctx.reg_alloc.ScratchGpr();
         code.mov(index.cvt32(), dword[r15 + offsetof(A64JitState, shared_rsb_ptr)]);
-        code.mov(value, target.Value());
+        code.MovGuestAddress(value, target.Value(), shared_block_origin, true);
         code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_locations) + index * 8], value);
-        code.mov(value, reinterpret_cast<u64>(cell));
+        code.lea(value, ptr[rip + cell]);
         code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_cells) + index * 8], value);
         code.mov(value, qword[r15 + offsetof(A64JitState, shared_observed_generation)]);
         code.mov(qword[r15 + offsetof(A64JitState, shared_rsb_generations) + index * 8], value);
@@ -1108,6 +1126,13 @@ void A64EmitX64::EmitA64SetPC(A64EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
+void A64EmitX64::EmitA64GuestAddress(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const auto result = ctx.reg_alloc.ScratchGpr();
+    code.MovGuestAddress(result, args[0].GetImmediateU64(), args[1].GetImmediateU64());
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.HostCall(nullptr);
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -1128,7 +1153,7 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     const u64 pc = args[0].GetImmediateU64();
     const u64 exception = args[1].GetImmediateU64();
     GetUserCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
-        code.mov(param[0], pc);
+        code.MovGuestAddress(param[0], pc, pc);
         code.mov(param[1], exception);
     });
     EmitReloadCachedRegisters();

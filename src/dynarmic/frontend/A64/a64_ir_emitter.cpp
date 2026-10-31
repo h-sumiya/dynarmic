@@ -22,6 +22,13 @@ u64 IREmitter::AlignPC(size_t alignment) const {
     return static_cast<u64>(pc - pc % alignment);
 }
 
+IR::U64 IREmitter::GuestAddress(u64 value) {
+    if (!relocatable_addresses) {
+        return Imm64(value);
+    }
+    return Inst<IR::U64>(Opcode::A64GuestAddress, Imm64(value), Imm64(PC()));
+}
+
 void IREmitter::SetCheckBit(const IR::U1& value) {
     Inst(Opcode::A64SetCheckBit, value);
 }

@@ -72,7 +72,7 @@ void EmitX64::EmitBreakpoint(EmitContext&, IR::Inst*) {
 void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, args[1], args[2], args[3]);
-    code.mov(rax, args[0].GetImmediateU64());
+    code.MovHostAddress(rax, args[0].GetImmediateU64());
     code.call(rax);
 }
 

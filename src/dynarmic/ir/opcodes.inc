@@ -42,6 +42,7 @@ A32OPC(GetFpscrNZCV,                                        U32,                
 A32OPC(SetFpscrNZCV,                                        Void,           NZCV                                                            )
 
 // A64 Context getters/setters
+A64OPC(GuestAddress,                                       U64,            U64,            U64                                             )
 A64OPC(SetCheckBit,                                         Void,           U1                                                              )
 A64OPC(TraceCheckZero32,                                    Void,           U64,            U32,            U1                              )
 A64OPC(TraceCheckZero64,                                    Void,           U64,            U64,            U1                              )

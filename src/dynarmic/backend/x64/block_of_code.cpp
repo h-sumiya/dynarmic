@@ -260,8 +260,57 @@ void BlockOfCode::PreludeComplete() {
         align(CodePageSize());
     prelude_complete = true;
     code_begin = getCurr();
+    prelude_data_size = constant_pool.UsedData().size();
     ClearCache();
     DisableWriting();
+}
+
+void BlockOfCode::MovHostAddress(Xbyak::Reg64 target, u64 address) {
+    MovRuntimeAddress(target, address, RelocationKind::HostAddress);
+}
+
+void BlockOfCode::MovRuntimeAddress(Xbyak::Reg64 target, u64 address, RelocationKind kind) {
+    if (!concurrent_append) {
+        mov(target, address);
+        return;
+    }
+    // A fixed-width immediate makes relocation independent of ASLR and of
+    // whether the original address happened to fit a shorter instruction.
+    db(0x48 | ((target.getIdx() >> 3) & 1));
+    db(0xB8 | (target.getIdx() & 7));
+    relocations.push_back({getSize(), address, 0, kind});
+    dq(address);
+}
+
+void BlockOfCode::MovGuestAddress(Xbyak::Reg64 target, u64 address, u64 origin, bool location) {
+    if (!concurrent_append) {
+        mov(target, address);
+        return;
+    }
+    db(0x48 | ((target.getIdx() >> 3) & 1));
+    db(0xB8 | (target.getIdx() & 7));
+    relocations.push_back({getSize(), address, origin,
+        location ? RelocationKind::GuestLocation : RelocationKind::GuestAddress});
+    dq(address);
+}
+
+void BlockOfCode::MovGuestPC(Xbyak::Reg64 target, u64 address, u64 origin) {
+    MovGuestAddress(target, address, origin);
+    if (concurrent_append) relocations.back().kind = RelocationKind::GuestPC;
+}
+
+std::span<const u8> BlockOfCode::PersistentData() const { return constant_pool.UsedData(); }
+std::size_t BlockOfCode::PersistentDataOffset() const {
+    return constant_pool.UsedData().data() - getCode();
+}
+
+void BlockOfCode::RestorePersistentBody(std::span<const u8> data, std::span<const u8> body) {
+    if (!concurrent_append || getCurr() != code_begin || body.size() > SpaceRemaining())
+        throw std::invalid_argument("Persistent A64 body does not fit an empty shared region");
+    constant_pool.RestoreData(data, prelude_data_size);
+    EnsureMemoryCommitted(body.size());
+    std::memcpy(const_cast<u8*>(static_cast<const u8*>(code_begin)), body.data(), body.size());
+    SetCodePtr(static_cast<const u8*>(code_begin) + body.size());
 }
 
 void BlockOfCode::EnableWriting() {

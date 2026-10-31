@@ -7,6 +7,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <list>
 #include <limits>
@@ -16,19 +17,23 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/backend/x64/a64_persistent_cache.h"
 #include "dynarmic/backend/page_range_index.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/a64_runtime_callback.h"
 #include "dynarmic/backend/x64/block_of_code.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt/passes.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 namespace Dynarmic::A64 {
 using namespace Backend::X64;
@@ -112,11 +117,18 @@ struct SharedRegion {
     bool retired = false;
     bool retire_requested = false;
     std::uint64_t retire_epoch = 0;
+    std::size_t saved_records = 0;
+    bool restored = false;
 };
 
 } // namespace
 
 struct SharedCodeCache::Impl {
+    struct PersistentImage {
+        std::string identity;
+        std::uint64_t address, size;
+        std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code;
+    };
     struct QueuedJob {
         SharedCodeSnapshot snapshot;
         std::chrono::steady_clock::time_point enqueued;
@@ -145,6 +157,8 @@ struct SharedCodeCache::Impl {
         try {
             for (std::size_t i = 0; i < config.worker_count; ++i)
                 workers.emplace_back([this, i] { Worker(i); });
+            if (!config.persistent_directory.empty())
+                persistence_worker = std::thread([this] { PersistenceWorker(); });
         } catch (...) {
             { std::lock_guard lock(mutex); stopping = true; }
             changed.notify_all();
@@ -163,6 +177,8 @@ struct SharedCodeCache::Impl {
         changed.notify_all();
         for (auto& worker : workers)
             worker.join();
+        if (persistence_worker.joinable()) persistence_worker.join();
+        SavePersistent();
         // Every attached Jit owns its shared_ptr<SharedCodeCache>; therefore
         // there cannot be a native reader when this final owner is destroyed.
         ASSERT(readers.empty());
@@ -204,6 +220,11 @@ struct SharedCodeCache::Impl {
     void RegisterIncoming(SharedRegion& source, std::uint64_t location,
                           std::atomic<const void*>* cell, const void* fallback) {
         std::lock_guard lock(mutex);
+        RegisterIncomingLocked(source, location, cell, fallback);
+    }
+
+    void RegisterIncomingLocked(SharedRegion& source, std::uint64_t location,
+                               std::atomic<const void*>* cell, const void* fallback) {
         auto [found, inserted] = incoming.try_emplace(location, nullptr);
         try {
             source.links.push_back({cell, fallback, nullptr, found->second, location});
@@ -442,7 +463,7 @@ struct SharedCodeCache::Impl {
             return instruction;
         };
         IR::Block ir = TranslateTrace(location, get_code,
-            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions},
+            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions, true},
             conf.HasOptimization(OptimizationFlag::GetSetElimination) && conf.HasOptimization(OptimizationFlag::ConstProp),
             conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.enable_cycle_counting);
         if (OptimizableTerminal(ir.GetTerminal())) {
@@ -467,11 +488,21 @@ struct SharedCodeCache::Impl {
             region.code.EnsureMemoryCommitted(1024 * 1024);
             const auto block = region.emitter.Emit(ir);
             auto result = std::make_unique<SharedPublishedBlock>(SharedPublishedBlock{
-                job.location, block.entrypoint, first_pc, first_pc + 3});
+                job.location, block.entrypoint, first_pc, first_pc + 3, {}, 0, {}});
+            result->host_size = block.size;
             std::sort(guest_words.begin(), guest_words.end());
             guest_words.erase(std::unique(guest_words.begin(), guest_words.end()), guest_words.end());
             result->guest_ranges.reserve(guest_words.size());
             for (const auto pc : guest_words) {
+                std::optional<std::uint32_t> word;
+                if (pc >= first_pc && (pc - first_pc) / 4 < job.instructions.size())
+                    word = job.instructions[(pc - first_pc) / 4];
+                else {
+                    const auto found = std::lower_bound(job.successors.begin(), job.successors.end(), pc,
+                        [](const auto& item, std::uint64_t address) { return item.first < address; });
+                    if (found != job.successors.end() && found->first == pc) word = found->second;
+                }
+                if (word) result->source_words.emplace_back(pc, *word);
                 if (!result->guest_ranges.empty() && result->guest_ranges.back().last != std::numeric_limits<u64>::max() &&
                     result->guest_ranges.back().last + 1 == pc) {
                     result->guest_ranges.back().last = pc + 3;
@@ -796,6 +827,17 @@ struct SharedCodeCache::Impl {
     }
 
     const SharedCodeCacheConfig config;
+    std::uint64_t PersistentContract() const;
+    Persistent::Reference GuestReference(Persistent::Region&, std::uint64_t value,
+                                        std::uint64_t origin, bool location, bool pc = false) const;
+    std::optional<Persistent::Region> SnapshotPersistent(SharedRegion&);
+    void SavePersistent();
+    void LoadPersistent();
+    void PersistenceWorker();
+    std::mutex persistence_io;
+    std::thread persistence_worker;
+    std::vector<PersistentImage> persistent_images;
+    std::unordered_set<std::string> restored_files;
     std::unique_ptr<std::atomic<const SharedPublishedBlock*>[]> index;
     // Separate cache lines keep the dispatch read-mostly generation apart from
     // worker-owned queue/counter state.
@@ -824,6 +866,8 @@ struct SharedCodeCache::Impl {
     SharedCodeCacheStatistics statistics;
 };
 
+#include "dynarmic/backend/x64/a64_persistent_cache.inc"
+
 SharedCodeCache::SharedCodeCache(SharedCodeCacheConfig config) : impl(std::make_unique<Impl>(config)) {}
 SharedCodeCache::~SharedCodeCache() = default;
 void SharedCodeCache::InvalidateRange(std::uint64_t address, std::size_t length) {
@@ -837,6 +881,28 @@ SharedCodeCacheStatistics SharedCodeCache::GetStatistics() const {
     result.pending_jobs = impl->pending.size();
     return result;
 }
+
+void SharedCodeCache::RegisterImage(std::string identity, std::uint64_t address, std::size_t size,
+                                  std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code, bool restore) {
+    if (impl->config.persistent_directory.empty()) return;
+    if (identity.empty() || !size || address > UINT64_MAX - size || !read_code)
+        throw std::invalid_argument("Invalid persistent A64 image registration");
+    {
+        std::lock_guard lock(impl->mutex);
+        const auto found = std::find_if(impl->persistent_images.begin(), impl->persistent_images.end(),
+            [&](const auto& image) { return image.address == address; });
+        if (found != impl->persistent_images.end()) {
+            if (found->identity != identity || found->size != size)
+                throw std::invalid_argument("A64 persistent image address is already registered");
+            return;
+        }
+        impl->persistent_images.push_back({std::move(identity), address, size, std::move(read_code)});
+    }
+    if (restore) impl->LoadPersistent();
+}
+
+void SharedCodeCache::RestorePersistence() { impl->LoadPersistent(); }
+void SharedCodeCache::FlushPersistence() { impl->SavePersistent(); }
 
 std::unique_ptr<SharedCacheReader> SharedCodeCacheAccess::Attach(SharedCodeCache& cache, const UserConfig& conf) {
     auto& self = *cache.impl;

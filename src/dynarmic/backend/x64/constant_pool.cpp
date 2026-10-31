@@ -6,6 +6,7 @@
 #include "dynarmic/backend/x64/constant_pool.h"
 
 #include <cstring>
+#include <stdexcept>
 
 #include <mcl/assert.hpp>
 
@@ -46,6 +47,20 @@ void* ConstantPool::AllocateMutableData(size_t bytes) {
     auto* result = pool.data() + insertion_point;
     insertion_point += slots;
     return result;
+}
+
+std::span<const u8> ConstantPool::UsedData() const {
+    return {reinterpret_cast<const u8*>(pool.data()), insertion_point * align_size};
+}
+
+void ConstantPool::RestoreData(std::span<const u8> data, std::size_t prelude_size) {
+    if (data.size() % align_size || data.size() > pool.size_bytes() ||
+        prelude_size > data.size() || prelude_size != insertion_point * align_size ||
+        (prelude_size && std::memcmp(pool.data(), data.data(), prelude_size) != 0))
+        throw std::invalid_argument("Persistent A64 constant pool does not match its prelude");
+    std::memcpy(reinterpret_cast<u8*>(pool.data()) + prelude_size,
+                data.data() + prelude_size, data.size() - prelude_size);
+    insertion_point = data.size() / align_size;
 }
 
 }  // namespace Dynarmic::Backend::X64

@@ -35,6 +35,9 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// Preserve PC-derived address provenance for persistent machine code.
+    bool relocatable_addresses = false;
 };
 
 /**

@@ -35,7 +35,7 @@ bool TranslatorVisitor::UnallocatedEncoding() {
 }
 
 bool TranslatorVisitor::RaiseException(Exception exception) {
-    ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+    ir.SetPC(ir.GuestAddress(ir.current_location->PC() + 4));
     ir.ExceptionRaised(exception);
     ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
     return false;

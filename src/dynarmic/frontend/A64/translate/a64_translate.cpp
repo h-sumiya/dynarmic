@@ -18,6 +18,38 @@
 
 namespace Dynarmic::A64 {
 
+namespace {
+
+// Resolve a trace successor without replacing address-bearing IR with constants.
+std::optional<u64> TraceAddress(IR::Value value, unsigned depth = 0) {
+    if (value.IsImmediate())
+        return value.GetU64();
+    if (depth >= 16)
+        return std::nullopt;
+    const auto* inst = value.GetInst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::A64GuestAddress:
+        return inst->GetArg(0).GetU64();
+    case IR::Opcode::Identity:
+        return TraceAddress(inst->GetArg(0), depth + 1);
+    case IR::Opcode::Add64:
+    case IR::Opcode::Sub64: {
+        const auto lhs = TraceAddress(inst->GetArg(0), depth + 1);
+        const auto rhs = TraceAddress(inst->GetArg(1), depth + 1);
+        const auto carry = inst->GetArg(2);
+        if (!lhs || !rhs || !carry.IsImmediate())
+            return std::nullopt;
+        if (inst->GetOpcode() == IR::Opcode::Add64)
+            return *lhs + *rhs + u64(carry.GetU1());
+        return *lhs - *rhs - u64(!carry.GetU1());
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+}  // namespace
+
 IR::Block Translate(LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
     const bool single_step = descriptor.SingleStepping();
 
@@ -181,8 +213,8 @@ IR::Block TranslateTrace(LocationDescriptor descriptor, MemoryReadCodeFuncType m
             for (auto it = block.rbegin(); it != block.rend(); ++it) {
                 if (it->GetOpcode() != IR::Opcode::A64SetPC)
                     continue;
-                if (it->GetArg(0).IsImmediate()) {
-                    next = current.SetPC(it->GetArg(0).GetU64());
+                if (const auto target = TraceAddress(it->GetArg(0))) {
+                    next = current.SetPC(*target);
                     branch_set_pc = &*it;
                 }
                 break;

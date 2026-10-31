@@ -26,13 +26,14 @@ class IREmitter : public IR::IREmitter {
 public:
     explicit IREmitter(IR::Block& block)
             : IR::IREmitter(block) {}
-    explicit IREmitter(IR::Block& block, LocationDescriptor descriptor)
-            : IR::IREmitter(block), current_location(descriptor) {}
+    explicit IREmitter(IR::Block& block, LocationDescriptor descriptor, bool relocatable_addresses = false)
+            : IR::IREmitter(block), current_location(descriptor), relocatable_addresses(relocatable_addresses) {}
 
     std::optional<LocationDescriptor> current_location;
 
     u64 PC() const;
     u64 AlignPC(size_t alignment) const;
+    IR::U64 GuestAddress(u64 value);
 
     void SetCheckBit(const IR::U1& value);
     IR::U1 GetCFlag();
@@ -96,6 +97,7 @@ public:
     void SetPC(const IR::U64& value);
 
 private:
+    bool relocatable_addresses = false;
     IR::U64 ImmCurrentLocationDescriptor();
 };
 

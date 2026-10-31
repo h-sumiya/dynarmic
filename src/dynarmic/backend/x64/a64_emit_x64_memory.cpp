@@ -446,7 +446,7 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak
         code.jnz(*abort, code.T_NEAR);
         ctx.deferred_emits.emplace_back([this, abort, current_location] {
             code.L(*abort);
-            code.mov(rax, current_location.PC());
+            code.MovGuestAddress(rax, current_location.PC(), current_location.PC());
             code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
             code.ForceReturnFromRunCode();
         });
@@ -456,7 +456,7 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak
     // successful return edge and emit its abort exit here, without appending
     // another deferred operation while the emitter iterates that collection.
     code.jz(*end, code.T_NEAR);
-    code.mov(rax, current_location.PC());
+    code.MovGuestAddress(rax, current_location.PC(), current_location.PC());
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
     code.ForceReturnFromRunCode();
 }

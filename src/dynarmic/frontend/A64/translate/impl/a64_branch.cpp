@@ -28,7 +28,7 @@ bool TranslatorVisitor::B_uncond(Imm<26> imm26) {
 bool TranslatorVisitor::BL(Imm<26> imm26) {
     const s64 offset = concatenate(imm26, Imm<2>{0}).SignExtend<s64>();
 
-    X(64, Reg::R30, ir.Imm64(ir.PC() + 4));
+    X(64, Reg::R30, ir.GuestAddress(ir.PC() + 4));
     ir.PushRSB(ir.current_location->AdvancePC(4));
 
     const u64 target = ir.PC() + offset;
@@ -39,7 +39,7 @@ bool TranslatorVisitor::BL(Imm<26> imm26) {
 bool TranslatorVisitor::BLR(Reg Rn) {
     const auto target = X(64, Rn);
 
-    X(64, Reg::R30, ir.Imm64(ir.PC() + 4));
+    X(64, Reg::R30, ir.GuestAddress(ir.PC() + 4));
     ir.PushRSB(ir.current_location->AdvancePC(4));
 
     ir.SetPC(target);

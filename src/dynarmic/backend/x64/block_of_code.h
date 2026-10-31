@@ -8,7 +8,9 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <span>
 #include <type_traits>
+#include <vector>
 
 #include <mcl/bit/bit_field.hpp>
 #include <mcl/stdint.hpp>
@@ -37,6 +39,13 @@ struct RunCodeCallbacks {
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
+    enum class RelocationKind : u8 { HostAddress, GuestAddress, GuestLocation, GlobalMonitor, ExclusiveBuckets, GuestPC };
+    struct Relocation {
+        std::size_t offset;
+        u64 value;
+        u64 origin;
+        RelocationKind kind;
+    };
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, bool concurrent_append = false);
     BlockOfCode(const BlockOfCode&) = delete;
 
@@ -49,6 +58,19 @@ public:
     void DisableWriting();
     /// Whether the emitted code ends on an instruction-page boundary.
     bool IsCodePageAligned() const;
+
+    // Persistent shared bodies keep their region-relative layout. The prelude
+    // and its OS exception registration are generated for each new region.
+    void MovHostAddress(Xbyak::Reg64 target, u64 address);
+    void MovRuntimeAddress(Xbyak::Reg64 target, u64 address, RelocationKind kind);
+    void MovGuestAddress(Xbyak::Reg64 target, u64 address, u64 origin, bool location = false);
+    void MovGuestPC(Xbyak::Reg64 target, u64 address, u64 origin);
+    const std::vector<Relocation>& Relocations() const { return relocations; }
+    std::span<const u8> PersistentData() const;
+    std::size_t PersistentDataOffset() const;
+    std::size_t PreludeSize() const { return static_cast<const u8*>(code_begin) - getCode(); }
+    u64 HostFeatures() const { return static_cast<u64>(host_features); }
+    void RestorePersistentBody(std::span<const u8> data, std::span<const u8> body);
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
@@ -96,6 +118,11 @@ public:
                       "Supplied type must be a pointer to a function");
 
         const u64 address = reinterpret_cast<u64>(fn);
+        if (concurrent_append) {
+            MovHostAddress(rax, address);
+            call(rax);
+            return;
+        }
         const u64 distance = address - (getCurr<u64>() + 5);
 
         if (distance >= 0x0000000080000000ULL && distance < 0xFFFFFFFF80000000ULL) {
@@ -196,6 +223,8 @@ private:
     // Shared regions append into fresh pages. Published pages never become
     // writable again; the non-executable constant pool is append-only data.
     const bool concurrent_append;
+    std::vector<Relocation> relocations;
+    std::size_t prelude_data_size = 0;
     size_t executable_begin = 0;
     size_t sealed_size = 0;
 

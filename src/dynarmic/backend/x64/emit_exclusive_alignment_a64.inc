@@ -14,7 +14,7 @@ void A64EmitX64::EmitExclusiveAlignmentCheck(A64EmitContext& ctx, IR::Inst* inst
         code.sub(rsp, 8);  // The ABI save helper expects entry after CALL.
         ABI_PushCallerSaveRegistersAndAdjustStack(code);
         GetUserCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
-            code.mov(param[0], current_location.PC());
+            code.MovGuestAddress(param[0], current_location.PC(), current_location.PC());
             code.mov(param[1], static_cast<u64>(A64::Exception::AlignmentFault));
         });
         ABI_PopCallerSaveRegistersAndAdjustStack(code);
@@ -22,7 +22,7 @@ void A64EmitX64::EmitExclusiveAlignmentCheck(A64EmitContext& ctx, IR::Inst* inst
         code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
         code.lock();
         code.or_(dword[r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::MemoryAbort));
-        code.mov(rax, current_location.PC());
+        code.MovGuestAddress(rax, current_location.PC(), current_location.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
         code.ForceReturnFromRunCode();
     });

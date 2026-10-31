@@ -11,7 +11,8 @@ void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 v
     code.xor_(pointer, tmp.cvt64());
     code.and_(pointer, ExclusiveMonitor::BUCKET_MASK);
     code.shl(pointer, 6);
-    code.mov(tmp.cvt64(), mcl::bit_cast<u64>(GetExclusiveMonitorBuckets(conf.global_monitor)));
+    code.MovRuntimeAddress(tmp.cvt64(), mcl::bit_cast<u64>(GetExclusiveMonitorBuckets(conf.global_monitor)),
+                           BlockOfCode::RelocationKind::ExclusiveBuckets);
     code.add(pointer, tmp.cvt64());
     EmitSpinLockLock(code, pointer, tmp);
 }
@@ -33,7 +34,8 @@ void EmitExclusiveBumpEpoch(BlockOfCode& code, const UserConfig& conf, Xbyak::Re
     if (bucket.getIdx() != code.ABI_PARAM2.getIdx()) {
         code.mov(code.ABI_PARAM2, bucket);
     }
-    code.mov(code.ABI_PARAM1, mcl::bit_cast<u64>(conf.global_monitor));
+    code.MovRuntimeAddress(code.ABI_PARAM1, mcl::bit_cast<u64>(conf.global_monitor),
+                           BlockOfCode::RelocationKind::GlobalMonitor);
     code.CallLambda([](ExclusiveMonitor& monitor, ExclusiveMonitor::Bucket& wrapped) {
         monitor.ResetEpochAfterWrap(wrapped);
     });
