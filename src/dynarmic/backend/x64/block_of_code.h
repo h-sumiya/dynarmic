@@ -46,6 +46,10 @@ public:
         u64 origin;
         RelocationKind kind;
     };
+    struct PersistentPatch {
+        std::size_t offset;
+        u64 value;
+    };
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, bool concurrent_append = false);
     BlockOfCode(const BlockOfCode&) = delete;
 
@@ -71,6 +75,9 @@ public:
     std::size_t PreludeSize() const { return static_cast<const u8*>(code_begin) - getCode(); }
     u64 HostFeatures() const { return static_cast<u64>(host_features); }
     void RestorePersistentBody(std::span<const u8> data, std::span<const u8> body);
+    // The caller pins the region and supplies only unpublished instructions.
+    // Existing instructions remain executable while their pages are writable.
+    void PatchPersistentCode(std::span<const PersistentPatch> patches);
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
@@ -220,11 +227,13 @@ private:
     bool prelude_complete = false;
     CodePtr code_begin = nullptr;
 
-    // Shared regions append into fresh pages. Published pages never become
-    // writable again; the non-executable constant pool is append-only data.
+    // Shared regions append into fresh pages. Published instruction bytes are
+    // immutable; persistent restoration can patch unpublished bytes sharing
+    // their pages. The non-executable constant pool is append-only data.
     const bool concurrent_append;
     std::vector<Relocation> relocations;
     std::size_t prelude_data_size = 0;
+    std::size_t persistent_body_end = 0;
     size_t executable_begin = 0;
     size_t sealed_size = 0;
 

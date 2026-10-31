@@ -208,27 +208,92 @@ void SharedCodeCache::Impl::LoadPersistent() {
             images = persistent_images; conf = *compile_config;
             contract = PersistentContract(); start_revision = revision.load(std::memory_order_acquire);
         }
+        std::unordered_map<std::string_view, const PersistentImage*> image_index;
+        for (const auto& image : images) image_index.emplace(image.identity, &image);
+        const auto finish = [&](const std::string& filename) {
+            restored_files.insert(filename);
+            const auto found = persistent_pending.find(filename);
+            if (found != persistent_pending.end()) {
+                persistent_pending_bytes -= found->second.bytes;
+                persistent_pending.erase(found);
+            }
+        };
         std::error_code error;
-        if (!std::filesystem::is_directory(config.persistent_directory, error)) return;
-        for (const auto& file : std::filesystem::directory_iterator(config.persistent_directory)) {
-            if (!file.is_regular_file() || file.path().extension() != ".a64c") continue;
-            const auto filename = file.path().filename().string();
+        std::vector<std::filesystem::path> files;
+        for (const auto& [filename, pending_file] : persistent_pending)
+            files.push_back(config.persistent_directory / filename);
+        if (std::filesystem::is_directory(config.persistent_directory, error)) {
+            for (const auto& file : std::filesystem::directory_iterator(config.persistent_directory)) {
+                if (file.is_regular_file() && file.path().extension() == ".a64c" &&
+                    !persistent_pending.contains(file.path().filename().string())) files.push_back(file.path());
+            }
+        }
+        for (const auto& file : files) {
+            const auto filename = file.filename().string();
             if (restored_files.contains(filename)) continue;
-            std::unique_ptr<SharedRegion> created;
+            std::list<std::unique_ptr<SharedRegion>> created;
+            SharedRegion* pinned = nullptr;
             bool charged = false;
-            try {
-                auto saved = Persistent::Read(file.path(), config.region_size * 8 + 16 * 1024 * 1024);
-                if (saved.runtime_identity != Persistent::RuntimeIdentity() || saved.contract != contract ||
-                    saved.capacity != config.region_size) {
-                    restored_files.insert(filename); continue;
+            SCOPE_EXIT {
+                created.clear();
+                std::lock_guard lock(mutex);
+                if (pinned) {
+                    pinned->building = false;
+                    if (pinned->retire_requested && !pinned->retired) Retire(*pinned);
                 }
-                if (saved.prelude > saved.capacity || saved.body.empty() || saved.body.size() > saved.capacity - saved.prelude ||
-                    saved.data_offset > saved.prelude || saved.data.size() > saved.prelude - saved.data_offset)
-                    throw std::runtime_error("Invalid persistent A64 region bounds");
+                if (charged) statistics.allocated_bytes -= config.region_size;
+            };
+            try {
+                auto found = persistent_pending.find(filename);
+                if (found == persistent_pending.end()) {
+                    const auto bytes = std::filesystem::file_size(file);
+                    if (bytes > config.persistent_capacity_bytes - std::min(persistent_pending_bytes, config.persistent_capacity_bytes)) continue;
+                    PersistentPendingFile pending_file;
+                    auto& saved = pending_file.saved;
+                    saved = Persistent::Read(file, config.region_size * 8 + 16 * 1024 * 1024);
+                    if (saved.runtime_identity != Persistent::RuntimeIdentity() || saved.contract != contract ||
+                        saved.capacity != config.region_size) {
+                        finish(filename); continue;
+                    }
+                    if (saved.prelude > saved.capacity || saved.body.empty() || saved.body.size() > saved.capacity - saved.prelude ||
+                        saved.data_offset > saved.prelude || saved.data.size() > saved.prelude - saved.data_offset)
+                        throw std::runtime_error("Invalid persistent A64 region bounds");
+                    std::sort(saved.blocks.begin(), saved.blocks.end(), [](const auto& left, const auto& right) {
+                        return left.entry < right.entry;
+                    });
+                    u64 end = saved.prelude;
+                    for (const auto& block : saved.blocks) {
+                        if (!block.size || block.entry < end || block.entry - saved.prelude > saved.body.size() ||
+                            block.size > saved.body.size() - (block.entry - saved.prelude) || block.words.empty() || block.words.size() > 4096)
+                            throw std::runtime_error("Invalid persistent A64 block bounds");
+                        end = block.entry + block.size;
+                    }
+                    for (const auto& host : saved.hosts) pending_file.hosts.push_back(Persistent::ResolveHostImage(host));
+                    std::unordered_set<u64> link_cells;
+                    for (const auto& link : saved.links) {
+                        if (!link_cells.insert(link.cell).second)
+                            throw std::runtime_error("Duplicate persistent A64 link cell");
+                    }
+                    pending_file.link_index.reserve(saved.links.size());
+                    for (std::size_t i = 0; i < saved.links.size(); ++i) pending_file.link_index.push_back(i);
+                    std::sort(pending_file.link_index.begin(), pending_file.link_index.end(), [&](auto left, auto right) {
+                        return saved.links[left].fallback < saved.links[right].fallback;
+                    });
+                    std::stable_sort(saved.relocations.begin(), saved.relocations.end(), [](const auto& left, const auto& right) {
+                        return left.offset < right.offset;
+                    });
+                    pending_file.processed.resize(saved.blocks.size());
+                    pending_file.bytes = bytes;
+                    found = persistent_pending.emplace(filename, std::move(pending_file)).first;
+                    persistent_pending_bytes += bytes;
+                }
+                auto& pending_file = found->second;
+                if (pending_file.tried_images == images.size()) continue;
+                auto& saved = pending_file.saved;
                 std::vector<const PersistentImage*> bindings;
                 for (const auto& identity : saved.images) {
-                    const auto found = std::find_if(images.begin(), images.end(), [&](const auto& image) { return image.identity == identity; });
-                    bindings.push_back(found == images.end() ? nullptr : &*found);
+                    const auto image = image_index.find(identity);
+                    bindings.push_back(image == image_index.end() ? nullptr : image->second);
                 }
                 const auto resolve = [&](const Persistent::Reference& ref, bool location) {
                     if (ref.image >= bindings.size()) throw std::runtime_error("Invalid persistent A64 image reference");
@@ -237,30 +302,21 @@ void SharedCodeCache::Impl::LoadPersistent() {
                     if (!location && ref.flags) throw std::runtime_error("Invalid persistent A64 address flags");
                     return location ? (address & LocationDescriptor::pc_mask) | ref.flags : address;
                 };
-                std::vector<Persistent::HostImage> hosts;
-                for (const auto& host : saved.hosts) hosts.push_back(Persistent::ResolveHostImage(host));
-                std::vector<const Persistent::Link*> link_index;
-                link_index.reserve(saved.links.size());
-                for (const auto& link : saved.links) link_index.push_back(&link);
-                std::sort(link_index.begin(), link_index.end(), [](const auto* left, const auto* right) {
-                    return left->fallback < right->fallback;
-                });
-                std::stable_sort(saved.relocations.begin(), saved.relocations.end(), [](const auto& left, const auto& right) {
-                    return left.offset < right.offset;
-                });
                 std::vector<std::unique_ptr<SharedPublishedBlock>> records;
+                std::vector<std::size_t> ready;
                 std::vector<std::pair<u64, u64>> selected;
+                std::vector<BlockOfCode::PersistentPatch> patches;
                 bool deferred = false;
-                for (const auto& block : saved.blocks) {
-                    if (!block.size || block.entry < saved.prelude || block.entry - saved.prelude > saved.body.size() ||
-                        block.size > saved.body.size() - (block.entry - saved.prelude) || block.words.empty() || block.words.size() > 4096)
-                        throw std::runtime_error("Invalid persistent A64 block bounds");
+                for (std::size_t i = 0; i < saved.blocks.size(); ++i) {
+                    if (pending_file.processed[i]) continue;
+                    const auto& block = saved.blocks[i];
+                    const auto patch_count = patches.size();
                     try {
                         auto record = std::make_unique<SharedPublishedBlock>();
                         record->location = resolve(block.location, true); record->host_size = block.size;
                         {
                             std::lock_guard lock(mutex);
-                            if (completed.contains(record->location)) continue;
+                            if (completed.contains(record->location)) { pending_file.processed[i] = true; continue; }
                         }
                         bool matches = true;
                         for (const auto& word : block.words) {
@@ -270,14 +326,12 @@ void SharedCodeCache::Impl::LoadPersistent() {
                                 image.read_code(address) != word.instruction) { matches = false; break; }
                             record->source_words.emplace_back(address, word.instruction);
                         }
-                        if (!matches) continue;
-                        // A ready body can still have a direct-link cell whose
-                        // target image is loaded later. Defer that body while
-                        // restoring independent blocks from the same file.
+                        if (!matches) { pending_file.processed[i] = true; continue; }
+                        const auto& link_index = pending_file.link_index;
                         auto link_it = std::lower_bound(link_index.begin(), link_index.end(), block.entry,
-                            [](const auto* link, u64 offset) { return link->fallback < offset; });
-                        for (; link_it != link_index.end() && (*link_it)->fallback - block.entry < block.size; ++link_it)
-                            (void)resolve((*link_it)->location, true);
+                            [&](auto link, u64 offset) { return saved.links[link].fallback < offset; });
+                        for (; link_it != link_index.end() && saved.links[*link_it].fallback - block.entry < block.size; ++link_it)
+                            (void)resolve(saved.links[*link_it].location, true);
                         auto relocation_it = std::lower_bound(saved.relocations.begin(), saved.relocations.end(), block.entry,
                             [](const auto& relocation, u64 offset) { return relocation.offset < offset; });
                         for (; relocation_it != saved.relocations.end() && relocation_it->offset - block.entry < block.size; ++relocation_it) {
@@ -287,7 +341,7 @@ void SharedCodeCache::Impl::LoadPersistent() {
                             u64 value = 0;
                             switch (static_cast<BlockOfCode::RelocationKind>(relocation.kind)) {
                             case BlockOfCode::RelocationKind::HostAddress: {
-                                const auto& host = hosts.at(relocation.target.image);
+                                const auto& host = pending_file.hosts.at(relocation.target.image);
                                 if (relocation.target.flags || relocation.target.offset >= host.size)
                                     throw std::runtime_error("Invalid persistent A64 helper offset");
                                 value = host.base + relocation.target.offset; break;
@@ -307,9 +361,8 @@ void SharedCodeCache::Impl::LoadPersistent() {
 #endif
                             default: throw std::runtime_error("Unknown persistent A64 relocation");
                             }
-                            std::memcpy(saved.body.data() + relocation.offset - saved.prelude, &value, sizeof(value));
+                            patches.push_back({static_cast<std::size_t>(relocation.offset), value});
                         }
-                        // Entry is a region-relative offset until allocation.
                         record->entrypoint = reinterpret_cast<const void*>(block.entry);
                         for (const auto& [pc, word] : record->source_words) {
                             if (!record->guest_ranges.empty() && record->guest_ranges.back().last + 1 == pc)
@@ -321,21 +374,17 @@ void SharedCodeCache::Impl::LoadPersistent() {
                         record->guest_start = record->guest_ranges.front().first;
                         record->guest_end = record->guest_ranges.back().last;
                         selected.emplace_back(block.entry, block.entry + block.size);
+                        ready.push_back(i);
                         records.push_back(std::move(record));
-                    } catch (const MissingPersistentImage&) { deferred = true; }
+                    } catch (const MissingPersistentImage&) { patches.resize(patch_count); deferred = true; }
                 }
                 if (records.empty()) {
-                    if (!deferred) restored_files.insert(filename);
+                    if (!deferred) finish(filename);
+                    else pending_file.tried_images = images.size();
                     continue;
                 }
-                std::sort(selected.begin(), selected.end());
-                std::size_t merged = 0;
-                for (const auto& range : selected) {
-                    if (merged && range.first <= selected[merged - 1].second)
-                        selected[merged - 1].second = std::max(selected[merged - 1].second, range.second);
-                    else selected[merged++] = range;
-                }
-                selected.resize(merged);
+                // Validated host bodies do not overlap, and selected preserves
+                // their entry order. Only this batch's unpublished bodies match.
                 const auto selected_offset = [&](u64 offset) {
                     auto range = std::upper_bound(selected.begin(), selected.end(), offset,
                         [](u64 value, const auto& candidate) { return value < candidate.first; });
@@ -347,7 +396,6 @@ void SharedCodeCache::Impl::LoadPersistent() {
                     if (link.cell < saved.data_offset || link.cell - saved.data_offset > saved.data.size() ||
                         sizeof(u64) > saved.data.size() - (link.cell - saved.data_offset) || link.cell % alignof(std::atomic<const void*>))
                         throw std::runtime_error("Invalid persistent A64 link cell");
-                    // Use a temporary reference with the resolved descriptor.
                     link.location = {0, resolve(link.location, true), 0};
                     links.push_back(link);
                 }
@@ -359,67 +407,97 @@ void SharedCodeCache::Impl::LoadPersistent() {
                         throw std::runtime_error("Invalid persistent A64 fastmem target");
                     faults.push_back({fault.rip, fault.resume, fault.callback});
                 }
+                SharedRegion* region = nullptr;
                 {
                     std::lock_guard lock(mutex);
                     if (stopping || start_revision != revision.load(std::memory_order_acquire)) return;
-                    if (statistics.allocated_bytes + config.region_size > config.capacity_bytes) continue;
-                    statistics.allocated_bytes += config.region_size; charged = true;
+                    if (pending_file.resident) {
+                        const auto resident = std::find_if(regions.begin(), regions.end(), [&](const auto& candidate) {
+                            return candidate->persistent_file == filename && !candidate->retired;
+                        });
+                        if (resident != regions.end() && !(*resident)->retire_requested) {
+                            region = resident->get();
+                            ASSERT(!region->building);
+                            region->building = true; pinned = region;
+                        }
+                    } else {
+                        if (statistics.allocated_bytes + config.region_size > config.capacity_bytes) continue;
+                        statistics.allocated_bytes += config.region_size; charged = true;
+                    }
                 }
-                created = std::make_unique<SharedRegion>(conf, config.region_size);
-                if (created->code.HostFeatures() != saved.features || created->code.PreludeSize() != saved.prelude ||
-                    created->code.PersistentDataOffset() != saved.data_offset)
-                    throw std::runtime_error("Persistent A64 prelude contract differs");
-                created->code.RestorePersistentBody(saved.data, saved.body);
-                const auto base = reinterpret_cast<u64>(created->code.getCode());
+                if (pending_file.resident && !region) { finish(filename); continue; }
+                if (!region) {
+                    created.push_back(std::make_unique<SharedRegion>(conf, config.region_size));
+                    region = created.front().get();
+                    if (region->code.HostFeatures() != saved.features || region->code.PreludeSize() != saved.prelude ||
+                        region->code.PersistentDataOffset() != saved.data_offset)
+                        throw std::runtime_error("Persistent A64 prelude contract differs");
+                    for (const auto& patch : patches)
+                        std::memcpy(saved.body.data() + patch.offset - saved.prelude, &patch.value, sizeof(patch.value));
+                    region->code.RestorePersistentBody(saved.data, saved.body);
+                    region->code.DisableWriting();
+                    region->sealed = true; region->restored = true;
+                    region->persistent_file = filename;
+                } else {
+                    region->code.PatchPersistentCode(patches);
+                }
+                const auto base = reinterpret_cast<u64>(region->code.getCode());
                 for (auto& record : records) {
                     record->entrypoint = reinterpret_cast<const void*>(base + reinterpret_cast<u64>(record->entrypoint));
                     for (auto& range : record->guest_ranges) range.owner = record.get();
                 }
-                created->records = std::move(records);
-                created->emitter.RestorePersistentFaults(faults);
-                for (const auto& link : links)
-                    std::construct_at(reinterpret_cast<std::atomic<const void*>*>(base + link.cell), reinterpret_cast<const void*>(base + link.fallback));
-                created->code.DisableWriting();
-                created->sealed = true; created->restored = true;
+                region->records.reserve(region->records.size() + records.size());
                 {
                     std::lock_guard lock(mutex);
-                    if (stopping || start_revision != revision.load(std::memory_order_acquire)) {
-                        statistics.allocated_bytes -= config.region_size; charged = false; continue;
+                    if (stopping || start_revision != revision.load(std::memory_order_acquire) || region->retire_requested) continue;
+                    if (!created.empty()) {
+                        region->building = true;
+                        regions.splice(regions.end(), created); charged = false; pinned = region;
+                        pending_file.resident = true;
+                        ++statistics.restored_regions;
                     }
-                    regions.push_back(std::move(created)); charged = false;
-                    auto& region = *regions.back();
-                    std::uint64_t published_count = 0;
                     try {
-                        for (const auto& link : links)
-                            RegisterIncomingLocked(region, link.location.offset,
-                                reinterpret_cast<std::atomic<const void*>*>(base + link.cell), reinterpret_cast<const void*>(base + link.fallback));
-                        for (const auto& record : region.records) {
-                            if (completed.contains(record->location)) continue;
-                            for (const auto& range : record->guest_ranges)
+                        // New metadata precedes publication; existing code,
+                        // cells and fault records are never copied or replaced.
+                        region->emitter.RestorePersistentFaults(faults);
+                        for (const auto& link : links) {
+                            auto* cell = reinterpret_cast<std::atomic<const void*>*>(base + link.cell);
+                            const auto* fallback = reinterpret_cast<const void*>(base + link.fallback);
+                            std::construct_at(cell, fallback);
+                            RegisterIncomingLocked(*region, link.location.offset, cell, fallback);
+                        }
+                        std::uint64_t published_count = 0;
+                        for (auto& record : records) {
+                            const auto* published = record.get();
+                            region->records.push_back(std::move(record));
+                            if (completed.contains(published->location)) continue;
+                            for (const auto& range : published->guest_ranges)
                                 published_ranges.Add(range.first, range.last, RangeKey(range));
-                            completed.emplace(record->location, record.get());
-                            PublishIndex(record.get()); UpdateIncoming(record->location, record->entrypoint);
+                            completed.emplace(published->location, published);
+                            PublishIndex(published); UpdateIncoming(published->location, published->entrypoint);
                             ++published_count;
                         }
                         statistics.live_blocks = completed.size();
                         statistics.restored_blocks += published_count;
-                        ++statistics.restored_regions;
+                        region->building = false; pinned = nullptr;
                     } catch (...) {
-                        // A failed range/map allocation can precede completed
-                        // publication. Remove those partial range entries too.
-                        for (const auto& record : region.records)
+                        for (const auto& record : region->records)
                             for (const auto& range : record->guest_ranges)
                                 published_ranges.Remove(RangeKey(range));
-                        Retire(region); throw;
+                        region->retire_requested = true;
+                        throw;
                     }
                 }
-                if (!deferred) restored_files.insert(filename);
+                for (const auto index : ready) pending_file.processed[index] = true;
+                if (!deferred) finish(filename);
+                else pending_file.tried_images = images.size();
             } catch (...) {
-                created.reset();
-                std::lock_guard lock(mutex);
-                if (charged) statistics.allocated_bytes -= config.region_size;
-                ++statistics.persistence_failures;
-                restored_files.insert(filename);
+                {
+                    std::lock_guard lock(mutex);
+                    if (pinned) pinned->retire_requested = true;
+                    ++statistics.persistence_failures;
+                }
+                finish(filename);
             }
         }
     } catch (...) {

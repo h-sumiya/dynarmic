@@ -14,12 +14,15 @@
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <mcl/scope_exit.hpp>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/a64_persistent_cache.h"
@@ -119,6 +122,7 @@ struct SharedRegion {
     std::uint64_t retire_epoch = 0;
     std::size_t saved_records = 0;
     bool restored = false;
+    std::string persistent_file;
 };
 
 } // namespace
@@ -128,6 +132,15 @@ struct SharedCodeCache::Impl {
         std::string identity;
         std::uint64_t address, size;
         std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code;
+    };
+    struct PersistentPendingFile {
+        Persistent::Region saved;
+        std::vector<Persistent::HostImage> hosts;
+        std::vector<std::size_t> link_index;
+        std::vector<bool> processed;
+        std::size_t tried_images = 0;
+        std::uint64_t bytes = 0;
+        bool resident = false;
     };
     struct QueuedJob {
         SharedCodeSnapshot snapshot;
@@ -838,6 +851,8 @@ struct SharedCodeCache::Impl {
     std::thread persistence_worker;
     std::vector<PersistentImage> persistent_images;
     std::unordered_set<std::string> restored_files;
+    std::unordered_map<std::string, PersistentPendingFile> persistent_pending;
+    std::uint64_t persistent_pending_bytes = 0;
     std::unique_ptr<std::atomic<const SharedPublishedBlock*>[]> index;
     // Separate cache lines keep the dispatch read-mostly generation apart from
     // worker-owned queue/counter state.

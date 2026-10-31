@@ -18,6 +18,7 @@
 #    include <sys/sysctl.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -311,6 +312,97 @@ void BlockOfCode::RestorePersistentBody(std::span<const u8> data, std::span<cons
     EnsureMemoryCommitted(body.size());
     std::memcpy(const_cast<u8*>(static_cast<const u8*>(code_begin)), body.data(), body.size());
     SetCodePtr(static_cast<const u8*>(code_begin) + body.size());
+    persistent_body_end = getSize();
+}
+
+void BlockOfCode::PatchPersistentCode(std::span<const PersistentPatch> patches) {
+    if (patches.empty())
+        return;
+    if (!concurrent_append || !persistent_body_end || sealed_size < persistent_body_end)
+        throw std::invalid_argument("Persistent A64 patches require a sealed restored region");
+
+    struct PageRange {
+        std::size_t begin, end;
+#ifdef _WIN32
+        DWORD protection = PAGE_EXECUTE_READ;
+#endif
+    };
+    const auto page_size = CodePageSize();
+    std::vector<PageRange> pages;
+    pages.reserve(patches.size());
+    for (const auto& patch : patches) {
+        if (patch.offset < PreludeSize() || patch.offset > persistent_body_end ||
+            sizeof(patch.value) > persistent_body_end - patch.offset)
+            throw std::invalid_argument("Persistent A64 patch is outside the restored body");
+        const auto begin = patch.offset - patch.offset % page_size;
+        const auto last = patch.offset + sizeof(patch.value) - 1;
+        const auto end = last - last % page_size + page_size;
+        if (end > sealed_size)
+            throw std::invalid_argument("Persistent A64 patch crosses unsealed pages");
+        pages.push_back({begin, end});
+    }
+    std::sort(pages.begin(), pages.end(), [](const auto& left, const auto& right) {
+        return left.begin < right.begin;
+    });
+    std::size_t merged = 0;
+    for (const auto& range : pages) {
+        if (merged && range.begin <= pages[merged - 1].end)
+            pages[merged - 1].end = std::max(pages[merged - 1].end, range.end);
+        else
+            pages[merged++] = range;
+    }
+    pages.resize(merged);
+
+    auto* base = const_cast<u8*>(getCode());
+    std::size_t writable = 0;
+    // All allocations and validation precede the protection changes. The
+    // sealed restored body is RX; no other writer may own this region.
+    const auto restore = [&]() noexcept {
+        bool success = true;
+        while (writable) {
+            const auto& range = pages[--writable];
+#ifdef _WIN32
+            DWORD ignored = 0;
+            if (!VirtualProtect(base + range.begin, range.end - range.begin, range.protection, &ignored))
+                success = false;
+#else
+            if (mprotect(base + range.begin, range.end - range.begin, PROT_READ | PROT_EXEC) != 0)
+                success = false;
+#endif
+        }
+        return success;
+    };
+    for (auto& range : pages) {
+#ifdef _WIN32
+        const bool success = VirtualProtect(base + range.begin, range.end - range.begin,
+                                            PAGE_EXECUTE_READWRITE, &range.protection) != 0;
+#else
+        const bool success = mprotect(base + range.begin, range.end - range.begin,
+                                      PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+#endif
+        if (!success) {
+            const bool restored = restore();
+            throw std::runtime_error(restored ? "Persistent A64 patch protection failed" :
+                                               "Persistent A64 patch protection rollback failed");
+        }
+        ++writable;
+    }
+    for (const auto& patch : patches)
+        std::memcpy(base + patch.offset, &patch.value, sizeof(patch.value));
+    const bool restored = restore();
+    bool flushed = true;
+    for (const auto& range : pages) {
+#ifdef _WIN32
+        if (!FlushInstructionCache(GetCurrentProcess(), base + range.begin, range.end - range.begin))
+            flushed = false;
+#else
+        __builtin___clear_cache(reinterpret_cast<char*>(base + range.begin),
+                                reinterpret_cast<char*>(base + range.end));
+#endif
+    }
+    if (!restored || !flushed)
+        throw std::runtime_error(!restored ? "Persistent A64 patch protection restore failed" :
+                                           "Persistent A64 instruction cache flush failed");
 }
 
 void BlockOfCode::EnableWriting() {
