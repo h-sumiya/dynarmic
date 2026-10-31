@@ -50,6 +50,16 @@
                 ++cache_statistics.shared_cache_hits;
                 return optimized;
             }
+            if (SharedCodeCacheAccess::RestoreForLocation(*conf.shared_code_cache, current_location.Value())) {
+                // Restoring can perform I/O and permit region retirement. Do
+                // not carry an entry across that work or the epoch refresh.
+                RefreshSharedCacheReader();
+                if (const auto optimized = SharedCodeCacheAccess::Lookup(*conf.shared_code_cache, current_location.Value())) {
+                    jit_state.last_lookup_is_shared = 1;
+                    ++cache_statistics.shared_cache_hits;
+                    return optimized;
+                }
+            }
             if (sampled && conf.enable_baseline_hot_optimization) {
                 using Clock = std::chrono::steady_clock;
                 const auto now = Clock::now();

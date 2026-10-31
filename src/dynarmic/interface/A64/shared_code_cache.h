@@ -43,6 +43,7 @@ struct SharedCodeCacheStatistics {
     std::uint64_t reclamation_nanoseconds = 0, reclamation_max_nanoseconds = 0;
     std::uint64_t restored_blocks = 0, restored_regions = 0, persisted_regions = 0;
     std::uint64_t persistent_bytes = 0, persistence_failures = 0, restore_nanoseconds = 0;
+    std::uint64_t index_files = 0, index_bytes = 0, payload_files = 0, payload_bytes = 0;
 };
 
 struct SharedCodeCacheAccess;

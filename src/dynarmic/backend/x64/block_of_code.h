@@ -46,10 +46,6 @@ public:
         u64 origin;
         RelocationKind kind;
     };
-    struct PersistentPatch {
-        std::size_t offset;
-        u64 value;
-    };
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, bool concurrent_append = false);
     BlockOfCode(const BlockOfCode&) = delete;
 
@@ -74,10 +70,10 @@ public:
     std::size_t PersistentDataOffset() const;
     std::size_t PreludeSize() const { return static_cast<const u8*>(code_begin) - getCode(); }
     u64 HostFeatures() const { return static_cast<u64>(host_features); }
-    void RestorePersistentBody(std::span<const u8> data, std::span<const u8> body);
+    void InitializePersistentBody(std::span<const u8> data, std::size_t body_end);
     // The caller pins the region and supplies only unpublished instructions.
-    // Existing instructions remain executable while their pages are writable.
-    void PatchPersistentCode(std::span<const PersistentPatch> patches);
+    // Neighboring published bytes stay executable while their page is written.
+    void ImportPersistentBlock(std::size_t offset, std::span<const u8> body);
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
@@ -234,6 +230,7 @@ private:
     std::vector<Relocation> relocations;
     std::size_t prelude_data_size = 0;
     std::size_t persistent_body_end = 0;
+    std::vector<bool> persistent_executable_pages;
     size_t executable_begin = 0;
     size_t sealed_size = 0;
 

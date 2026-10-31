@@ -71,6 +71,9 @@ struct SharedCodeCacheAccess {
     static std::uint64_t DispatchMask(const SharedCodeCache&);
     static std::uint64_t Revision(const SharedCodeCache&);
     static const void* Lookup(const SharedCodeCache&, std::uint64_t location);
+    // C++ dispatch misses can materialize saved optimized code without a
+    // compilation request. Refresh the reader and look up the entry afterward.
+    static bool RestoreForLocation(SharedCodeCache&, std::uint64_t location);
     static void Capture(SharedCodeSnapshot&, UserCallbacks&);
     // Nonblocking admission: if the scheduler is busy/full, simply try later.
     static bool Request(SharedCodeCache&, SharedCodeSnapshot);

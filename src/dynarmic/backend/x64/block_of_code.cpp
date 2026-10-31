@@ -305,108 +305,94 @@ std::size_t BlockOfCode::PersistentDataOffset() const {
     return constant_pool.UsedData().data() - getCode();
 }
 
-void BlockOfCode::RestorePersistentBody(std::span<const u8> data, std::span<const u8> body) {
-    if (!concurrent_append || getCurr() != code_begin || body.size() > SpaceRemaining())
+void BlockOfCode::InitializePersistentBody(std::span<const u8> data, std::size_t body_end) {
+    if (!concurrent_append || persistent_body_end || getCurr() != code_begin ||
+        body_end <= PreludeSize() || body_end > maxSize_)
         throw std::invalid_argument("Persistent A64 body does not fit an empty shared region");
+    const auto page_size = CodePageSize();
+    std::vector<bool> pages(body_end / page_size + (body_end % page_size != 0), false);
+    EnsureMemoryCommitted(body_end - PreludeSize());
     constant_pool.RestoreData(data, prelude_data_size);
-    EnsureMemoryCommitted(body.size());
-    std::memcpy(const_cast<u8*>(static_cast<const u8*>(code_begin)), body.data(), body.size());
-    SetCodePtr(static_cast<const u8*>(code_begin) + body.size());
-    persistent_body_end = getSize();
+    // Claim the original layout without reading, copying or sealing its body.
+    // Only ImportPersistentBlock may populate these sparse instruction pages.
+    SetCodePtr(getCode() + body_end);
+    persistent_body_end = body_end;
+    persistent_executable_pages = std::move(pages);
 }
 
-void BlockOfCode::PatchPersistentCode(std::span<const PersistentPatch> patches) {
-    if (patches.empty())
-        return;
-    if (!concurrent_append || !persistent_body_end || sealed_size < persistent_body_end)
-        throw std::invalid_argument("Persistent A64 patches require a sealed restored region");
+void BlockOfCode::ImportPersistentBlock(std::size_t offset, std::span<const u8> body) {
+    if (!concurrent_append || !persistent_body_end || body.empty() || offset < PreludeSize() ||
+        offset > persistent_body_end || body.size() > persistent_body_end - offset)
+        throw std::invalid_argument("Persistent A64 block is outside the reserved body");
 
     struct PageRange {
         std::size_t begin, end;
-#ifdef _WIN32
-        DWORD protection = PAGE_EXECUTE_READ;
-#endif
+        bool executable;
     };
     const auto page_size = CodePageSize();
+    const auto first_page = offset / page_size;
+    const auto last_page = (offset + body.size() - 1) / page_size;
     std::vector<PageRange> pages;
-    pages.reserve(patches.size());
-    for (const auto& patch : patches) {
-        if (patch.offset < PreludeSize() || patch.offset > persistent_body_end ||
-            sizeof(patch.value) > persistent_body_end - patch.offset)
-            throw std::invalid_argument("Persistent A64 patch is outside the restored body");
-        const auto begin = patch.offset - patch.offset % page_size;
-        const auto last = patch.offset + sizeof(patch.value) - 1;
-        const auto end = last - last % page_size + page_size;
-        if (end > sealed_size)
-            throw std::invalid_argument("Persistent A64 patch crosses unsealed pages");
-        pages.push_back({begin, end});
-    }
-    std::sort(pages.begin(), pages.end(), [](const auto& left, const auto& right) {
-        return left.begin < right.begin;
-    });
-    std::size_t merged = 0;
-    for (const auto& range : pages) {
-        if (merged && range.begin <= pages[merged - 1].end)
-            pages[merged - 1].end = std::max(pages[merged - 1].end, range.end);
+    pages.reserve(last_page - first_page + 1);
+    for (auto page = first_page; page <= last_page; ++page) {
+        const bool executable = persistent_executable_pages[page];
+        if (!pages.empty() && pages.back().executable == executable)
+            pages.back().end += page_size;
         else
-            pages[merged++] = range;
+            pages.push_back({page * page_size, (page + 1) * page_size, executable});
     }
-    pages.resize(merged);
 
     auto* base = const_cast<u8*>(getCode());
-    std::size_t writable = 0;
-    // All allocations and validation precede the protection changes. The
-    // sealed restored body is RX; no other writer may own this region.
-    const auto restore = [&]() noexcept {
-        bool success = true;
-        while (writable) {
-            const auto& range = pages[--writable];
+    const auto protect = [&](const PageRange& range, bool executable, bool writable) noexcept {
 #ifdef _WIN32
-            DWORD ignored = 0;
-            if (!VirtualProtect(base + range.begin, range.end - range.begin, range.protection, &ignored))
-                success = false;
+        const DWORD protection = executable ? (writable ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ) : PAGE_READWRITE;
+        DWORD ignored = 0;
+        return VirtualProtect(base + range.begin, range.end - range.begin, protection, &ignored) != 0;
 #else
-            if (mprotect(base + range.begin, range.end - range.begin, PROT_READ | PROT_EXEC) != 0)
-                success = false;
+        const int protection = PROT_READ | (writable ? PROT_WRITE : 0) | (executable ? PROT_EXEC : 0);
+        return mprotect(base + range.begin, range.end - range.begin, protection) == 0;
 #endif
-        }
+    };
+    // Validation and allocations precede any permission change. Only this
+    // importer writes the region, so the page map describes its original RX/RW
+    // permissions and supplies rollback without querying unrelated pages.
+    const auto rollback = [&]() noexcept {
+        bool success = true;
+        for (const auto& range : pages)
+            if (!protect(range, range.executable, !range.executable))
+                success = false;
         return success;
     };
-    for (auto& range : pages) {
-#ifdef _WIN32
-        const bool success = VirtualProtect(base + range.begin, range.end - range.begin,
-                                            PAGE_EXECUTE_READWRITE, &range.protection) != 0;
-#else
-        const bool success = mprotect(base + range.begin, range.end - range.begin,
-                                      PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
-#endif
-        if (!success) {
-            const bool restored = restore();
-            throw std::runtime_error(restored ? "Persistent A64 patch protection failed" :
-                                               "Persistent A64 patch protection rollback failed");
-        }
-        ++writable;
-    }
-    for (const auto& patch : patches)
-        std::memcpy(base + patch.offset, &patch.value, sizeof(patch.value));
-    const bool restored = restore();
-    bool flushed = true;
     for (const auto& range : pages) {
-#ifdef _WIN32
-        if (!FlushInstructionCache(GetCurrentProcess(), base + range.begin, range.end - range.begin))
-            flushed = false;
-#else
-        __builtin___clear_cache(reinterpret_cast<char*>(base + range.begin),
-                                reinterpret_cast<char*>(base + range.end));
-#endif
+        if (range.executable && !protect(range, true, true)) {
+            const bool restored = rollback();
+            throw std::runtime_error(restored ? "Persistent A64 import protection failed" :
+                                               "Persistent A64 import protection rollback failed");
+        }
     }
-    if (!restored || !flushed)
-        throw std::runtime_error(!restored ? "Persistent A64 patch protection restore failed" :
-                                           "Persistent A64 instruction cache flush failed");
+    std::memcpy(base + offset, body.data(), body.size());
+    for (const auto& range : pages) {
+        if (!protect(range, true, false)) {
+            const bool restored = rollback();
+            throw std::runtime_error(restored ? "Persistent A64 import sealing failed" :
+                                               "Persistent A64 import sealing rollback failed");
+        }
+    }
+    for (auto page = first_page; page <= last_page; ++page)
+        persistent_executable_pages[page] = true;
+#ifdef _WIN32
+    if (!FlushInstructionCache(GetCurrentProcess(), base + offset, body.size()))
+        throw std::runtime_error("Persistent A64 instruction cache flush failed");
+#else
+    __builtin___clear_cache(reinterpret_cast<char*>(base + offset),
+                            reinterpret_cast<char*>(base + offset + body.size()));
+#endif
 }
 
 void BlockOfCode::EnableWriting() {
     if (concurrent_append) {
+        if (persistent_body_end)
+            throw std::logic_error("Persistent A64 regions require block imports");
         ASSERT(getSize() >= sealed_size);
         return;
     }
@@ -425,6 +411,8 @@ bool BlockOfCode::IsCodePageAligned() const {
 
 void BlockOfCode::DisableWriting() {
     if (concurrent_append) {
+        if (persistent_body_end)
+            return;
         EnsureMemoryCommitted(CodePageSize());
         align(CodePageSize());
         const size_t end = getSize();

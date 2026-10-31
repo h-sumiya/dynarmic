@@ -134,13 +134,22 @@ struct SharedCodeCache::Impl {
         std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code;
     };
     struct PersistentPendingFile {
-        Persistent::Region saved;
         std::vector<Persistent::HostImage> hosts;
-        std::vector<std::size_t> link_index;
+        std::vector<std::optional<PersistentImage>> bindings;
         std::vector<bool> processed;
-        std::size_t tried_images = 0;
-        std::uint64_t bytes = 0;
+        std::unordered_set<std::uint64_t> cells;
+        std::unordered_map<std::size_t, std::size_t> deferred_images;
+        std::size_t bound_images = 0;
         bool resident = false;
+        bool counted_file = false;
+    };
+    struct PersistentIndexFile {
+        std::string filename;
+        Persistent::Index saved;
+    };
+    struct PersistentIndexLocation {
+        std::uint64_t offset, flags;
+        std::size_t file, block;
     };
     struct QueuedJob {
         SharedCodeSnapshot snapshot;
@@ -846,13 +855,19 @@ struct SharedCodeCache::Impl {
     std::optional<Persistent::Region> SnapshotPersistent(SharedRegion&);
     void SavePersistent();
     void LoadPersistent();
+    void RestorePersistentBlock(std::size_t file, std::size_t block);
     void PersistenceWorker();
     std::mutex persistence_io;
     std::thread persistence_worker;
     std::vector<PersistentImage> persistent_images;
+    std::unordered_map<std::string, std::size_t> persistent_image_index;
     std::unordered_set<std::string> restored_files;
     std::unordered_map<std::string, PersistentPendingFile> persistent_pending;
-    std::uint64_t persistent_pending_bytes = 0;
+    std::atomic<bool> persistent_index_ready{false}, persistent_index_nonempty{false};
+    std::vector<PersistentIndexFile> persistent_index_files;
+    std::unordered_map<std::string, std::vector<PersistentIndexLocation>> persistent_locations;
+    std::vector<std::size_t> persistent_image_order;
+    std::unordered_map<std::uint64_t, std::tuple<std::size_t, std::uint64_t, std::uint64_t>> persistent_misses;
     std::unique_ptr<std::atomic<const SharedPublishedBlock*>[]> index;
     // Separate cache lines keep the dispatch read-mostly generation apart from
     // worker-owned queue/counter state.
@@ -911,6 +926,7 @@ void SharedCodeCache::RegisterImage(std::string identity, std::uint64_t address,
                 throw std::invalid_argument("A64 persistent image address is already registered");
             return;
         }
+        impl->persistent_image_index.emplace(identity, impl->persistent_images.size());
         impl->persistent_images.push_back({std::move(identity), address, size, std::move(read_code)});
     }
     if (restore) impl->LoadPersistent();
@@ -918,6 +934,73 @@ void SharedCodeCache::RegisterImage(std::string identity, std::uint64_t address,
 
 void SharedCodeCache::RestorePersistence() { impl->LoadPersistent(); }
 void SharedCodeCache::FlushPersistence() { impl->SavePersistent(); }
+
+bool SharedCodeCacheAccess::RestoreForLocation(SharedCodeCache& cache, std::uint64_t location) {
+    auto& self = *cache.impl;
+    try {
+        self.LoadPersistent();
+        if (!self.persistent_index_nonempty.load(std::memory_order_acquire)) return false;
+        const auto pc = LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+        const auto flags = location & ~LocationDescriptor::pc_mask;
+        std::string identity;
+        u64 offset, epoch, allocated;
+        std::size_t image_count;
+        {
+            std::lock_guard lock(self.mutex);
+            if (self.stopping) return false;
+            if (self.completed.contains(location)) return true;
+            image_count = self.persistent_images.size();
+            epoch = self.generation.load(std::memory_order_relaxed);
+            allocated = self.statistics.allocated_bytes;
+            const auto missed = self.persistent_misses.find(location);
+            if (missed != self.persistent_misses.end() && missed->second == std::tuple{image_count, epoch, allocated}) return false;
+            if (self.persistent_image_order.size() != image_count) {
+                self.persistent_image_order.clear();
+                self.persistent_image_order.reserve(image_count);
+                for (std::size_t i = 0; i < image_count; ++i) self.persistent_image_order.push_back(i);
+                std::sort(self.persistent_image_order.begin(), self.persistent_image_order.end(), [&](auto left, auto right) {
+                    return self.persistent_images[left].address < self.persistent_images[right].address;
+                });
+            }
+            auto image = std::upper_bound(self.persistent_image_order.begin(), self.persistent_image_order.end(), pc,
+                [&](u64 address, auto candidate) { return address < self.persistent_images[candidate].address; });
+            if (image == self.persistent_image_order.begin()) return false;
+            const auto& registered = self.persistent_images[*std::prev(image)];
+            if (pc - registered.address >= registered.size) return false;
+            identity = registered.identity; offset = pc - registered.address;
+        }
+        // The index is immutable after its release publication. Binding a
+        // guest address needs no payload read and no per-block rebased map.
+        const auto found = self.persistent_locations.find(identity);
+        if (found == self.persistent_locations.end()) return false;
+        const auto& entries = found->second;
+        auto candidate = std::lower_bound(entries.begin(), entries.end(), std::pair{offset, flags},
+            [](const auto& entry, const auto& key) { return std::pair{entry.offset, entry.flags} < key; });
+        if (candidate == entries.end() || candidate->offset != offset || candidate->flags != flags) return false;
+        auto previous_file = std::numeric_limits<std::size_t>::max();
+        for (; candidate != entries.end() && candidate->offset == offset && candidate->flags == flags; ++candidate) {
+            if (candidate->file == previous_file) continue;
+            previous_file = candidate->file;
+            self.RestorePersistentBlock(candidate->file, candidate->block);
+            std::lock_guard lock(self.mutex);
+            if (self.completed.contains(location)) return true;
+        }
+        {
+            std::lock_guard lock(self.mutex);
+            // Missing images, invalidation and retirement can make an earlier
+            // miss retryable. Do not repeat a full file validation each time a
+            // baseline block executes while the relevant state is unchanged.
+            if (image_count == self.persistent_images.size() && epoch == self.generation.load(std::memory_order_relaxed) &&
+                allocated == self.statistics.allocated_bytes) {
+                if (self.persistent_misses.size() >= self.config.max_pending_jobs) self.persistent_misses.clear();
+                self.persistent_misses[location] = {image_count, epoch, allocated};
+            }
+        }
+    } catch (...) {
+        std::lock_guard lock(self.mutex); ++self.statistics.persistence_failures;
+    }
+    return false;
+}
 
 std::unique_ptr<SharedCacheReader> SharedCodeCacheAccess::Attach(SharedCodeCache& cache, const UserConfig& conf) {
     auto& self = *cache.impl;

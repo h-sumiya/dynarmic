@@ -24,9 +24,101 @@
 #endif
 
 namespace Dynarmic::A64::Persistent {
+
+struct File {
+    explicit File(const std::filesystem::path& path) {
+#ifdef _WIN32
+        handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
+        LARGE_INTEGER length{};
+        if (handle == INVALID_HANDLE_VALUE || !GetFileSizeEx(handle, &length) || length.QuadPart < 0) {
+            if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+            throw std::runtime_error("Cannot open A64 machine-code cache");
+        }
+        size = static_cast<std::uint64_t>(length.QuadPart);
+#else
+        input.open(path, std::ios::binary | std::ios::ate);
+        const auto length = input.tellg();
+        if (!input || length < 0) throw std::runtime_error("Cannot open A64 machine-code cache");
+        size = static_cast<std::uint64_t>(length);
+#endif
+    }
+    ~File() {
+#ifdef _WIN32
+        CloseHandle(handle);
+#endif
+    }
+    std::vector<std::uint8_t> Read(std::uint64_t offset, std::uint64_t length) {
+        if (offset > size || length > size - offset || length > std::numeric_limits<std::size_t>::max() ||
+            length > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+            throw std::runtime_error("Invalid A64 cache file range");
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+        if (bytes.empty()) return bytes;
+        std::lock_guard lock(mutex);
+#ifdef _WIN32
+        LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN))
+            throw std::runtime_error("Cannot seek A64 machine-code cache");
+        std::size_t done = 0;
+        while (done < bytes.size()) {
+            const auto chunk = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - done, MAXDWORD));
+            DWORD count = 0;
+            if (!ReadFile(handle, bytes.data() + done, chunk, &count, nullptr) || count != chunk)
+                throw std::runtime_error("Cannot read A64 machine-code cache");
+            done += count;
+        }
+#else
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length));
+        if (!input) throw std::runtime_error("Cannot read A64 machine-code cache");
+#endif
+        return bytes;
+    }
+    std::uint64_t size = 0;
+    std::mutex mutex;
+#ifdef _WIN32
+    HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+    std::ifstream input;
+#endif
+};
+
 namespace {
-constexpr std::array<std::uint8_t, 8> magic{'A', '2', 'E', 'A', '6', '4', 'C', 1};
+constexpr std::array<std::uint8_t, 8> magic{'A', '2', 'E', 'A', '6', '4', 'C', 3};
 constexpr std::size_t maximum_items = 4 * 1024 * 1024;
+constexpr std::uint64_t header_size = 32;
+constexpr std::uint64_t maximum_index_bytes = 16 * 1024 * 1024;
+constexpr std::uint64_t maximum_data_bytes = 256 * 1024;
+
+#ifdef _WIN32
+void Publish(const std::filesystem::path& source, const std::filesystem::path& target) {
+    const auto name = std::filesystem::absolute(target).native();
+    const auto bytes = offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(wchar_t);
+    std::vector<std::uint8_t> storage(bytes);
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+    rename->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    rename->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+    std::memcpy(rename->FileName, name.c_str(), (name.size() + 1) * sizeof(wchar_t));
+    const auto handle = CreateFileW(source.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open A64 cache for publication");
+    const auto success = SetFileInformationByHandle(handle, FileRenameInfoEx, rename, static_cast<DWORD>(bytes));
+    const auto error = GetLastError();
+    CloseHandle(handle);
+    if (!success) throw std::runtime_error("Cannot publish A64 machine-code cache: " + std::to_string(error));
+}
+
+bool Remove(const std::filesystem::path& path) {
+    const auto handle = CreateFileW(path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    FILE_DISPOSITION_INFO_EX disposition{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS};
+    const auto success = SetFileInformationByHandle(handle, FileDispositionInfoEx, &disposition, sizeof(disposition));
+    CloseHandle(handle);
+    return success != 0;
+}
+#endif
 
 std::string FileIdentity(const std::filesystem::path& path) {
     const auto metadata = std::to_string(std::filesystem::file_size(path)) + ":" +
@@ -93,22 +185,97 @@ struct Reader {
         return result;
     }
     std::string String() {
-        auto value = Bytes();
-        if (value.size() > 65536) throw std::runtime_error("Invalid A64 cache string");
-        return {reinterpret_cast<const char*>(value.data()), value.size()};
+        const auto size = Integer<std::uint64_t>();
+        if (size > 65536 || size > bytes.size()) throw std::runtime_error("Invalid A64 cache string");
+        std::string value(reinterpret_cast<const char*>(bytes.data()), static_cast<std::size_t>(size));
+        bytes = bytes.subspan(size);
+        return value;
     }
     Reference Ref() {
         Reference ref; ref.image = Integer<std::uint32_t>(); ref.offset = Integer<std::uint64_t>();
         ref.flags = Integer<std::uint64_t>(); return ref;
     }
-    template<class T, class F> std::vector<T> Vector(F read) {
+    template<class T, class F> std::vector<T> Vector(F read, std::size_t minimum_bytes = 1) {
         const auto count = Integer<std::uint64_t>();
-        if (count > maximum_items || count > bytes.size()) throw std::runtime_error("Invalid A64 cache item count");
+        if (count > maximum_items || count > bytes.size() / minimum_bytes) throw std::runtime_error("Invalid A64 cache item count");
         std::vector<T> result; result.reserve(count);
         for (std::uint64_t i = 0; i < count; ++i) result.push_back(read());
         return result;
     }
 };
+
+Writer EncodeIndex(const Index& index) {
+    Writer w;
+    w.String(index.runtime_identity); w.Integer(index.contract); w.Integer(index.features);
+    w.Integer(index.capacity); w.Integer(index.prelude); w.Integer(index.data_offset); w.Integer(index.body_end);
+    w.Vector(index.images, [&](const auto& value) { w.String(value); });
+    w.Vector(index.hosts, [&](const auto& value) { w.String(value.name); w.String(value.identity); w.Integer(value.size); });
+    w.Integer(index.data_file_offset); w.Integer(index.data_size); w.Integer(index.data_checksum);
+    w.Vector(index.blocks, [&](const auto& value) {
+        w.Ref(value.location); w.Integer(value.entry); w.Integer(value.size);
+        w.Integer(value.record_offset); w.Integer(value.record_size); w.Integer(value.record_checksum);
+    });
+    return w;
+}
+
+Index ReadFront(std::shared_ptr<File> file, std::uint64_t maximum_bytes) {
+    if (file->size < header_size || file->size > maximum_bytes)
+        throw std::runtime_error("Invalid A64 machine-code cache size");
+    const auto header_bytes = file->Read(0, header_size);
+    if (!std::equal(magic.begin(), magic.end(), header_bytes.begin()))
+        throw std::runtime_error("Invalid A64 machine-code cache header");
+    Reader header{std::span(header_bytes).subspan(magic.size())};
+    const auto index_size = header.Integer<std::uint64_t>();
+    const auto index_checksum = header.Integer<std::uint64_t>();
+    const auto file_size = header.Integer<std::uint64_t>();
+    if (file_size != file->size || index_size > maximum_index_bytes || index_size > file_size - header_size)
+        throw std::runtime_error("Invalid A64 cache section sizes");
+    const auto bytes = file->Read(header_size, index_size);
+    if (Hash(bytes) != index_checksum)
+        throw std::runtime_error("Damaged A64 cache index");
+    Reader reader{bytes};
+    Index index;
+    index.file = std::move(file); index.file_size = file_size;
+    index.read_bytes = header_size + index_size;
+    index.runtime_identity = reader.String();
+    index.contract = reader.Integer<std::uint64_t>();
+    index.features = reader.Integer<std::uint64_t>();
+    index.capacity = reader.Integer<std::uint64_t>();
+    index.prelude = reader.Integer<std::uint64_t>();
+    index.data_offset = reader.Integer<std::uint64_t>();
+    index.body_end = reader.Integer<std::uint64_t>();
+    index.images = reader.Vector<std::string>([&] { return reader.String(); }, sizeof(std::uint64_t));
+    index.hosts = reader.Vector<HostImage>([&] {
+        HostImage value; value.name = reader.String(); value.identity = reader.String(); value.size = reader.Integer<std::uint64_t>();
+        return value;
+    }, 3 * sizeof(std::uint64_t));
+    index.data_file_offset = reader.Integer<std::uint64_t>();
+    index.data_size = reader.Integer<std::uint64_t>();
+    index.data_checksum = reader.Integer<std::uint64_t>();
+    if (index.prelude > index.capacity || index.body_end < index.prelude || index.body_end > index.capacity ||
+        index.data_offset > index.prelude || index.data_size > index.prelude - index.data_offset ||
+        index.data_size > maximum_data_bytes || index.data_file_offset != index.read_bytes ||
+        index.data_size > file_size - index.data_file_offset)
+        throw std::runtime_error("Invalid A64 cache region layout");
+    auto next_record = index.data_file_offset + index.data_size;
+    auto block_end = index.prelude;
+    index.blocks = reader.Vector<BlockIndex>([&] {
+        BlockIndex block; block.location = reader.Ref(); block.entry = reader.Integer<std::uint64_t>();
+        block.size = reader.Integer<std::uint64_t>(); block.record_offset = reader.Integer<std::uint64_t>();
+        block.record_size = reader.Integer<std::uint64_t>(); block.record_checksum = reader.Integer<std::uint64_t>();
+        if (block.location.image >= index.images.size() || !block.size || block.entry < block_end ||
+            block.entry > index.body_end || block.size > index.body_end - block.entry ||
+            block.record_offset != next_record || block.record_size > file_size - next_record ||
+            block.record_size < block.size || block.record_size - block.size < 100)
+            throw std::runtime_error("Invalid A64 cache block index");
+        block_end = block.entry + block.size;
+        next_record += block.record_size;
+        return block;
+    }, sizeof(std::uint32_t) + 7 * sizeof(std::uint64_t));
+    if (!reader.bytes.empty()) throw std::runtime_error("Trailing A64 cache index data");
+    if (index.blocks.empty() || next_record != file_size) throw std::runtime_error("Invalid A64 cache record layout");
+    return index;
+}
 }
 
 std::uint64_t Hash(std::span<const std::uint8_t> bytes, std::uint64_t seed) {
@@ -199,22 +366,78 @@ std::string Key(const Region& region) {
 }
 
 void Write(const std::filesystem::path& path, const Region& region) {
-    Writer w;
-    w.String(region.runtime_identity); w.Integer(region.contract); w.Integer(region.features);
-    w.Integer(region.capacity); w.Integer(region.prelude); w.Integer(region.data_offset);
-    w.Vector(region.images, [&](const auto& value) { w.String(value); });
-    w.Vector(region.hosts, [&](const auto& value) { w.String(value.name); w.String(value.identity); w.Integer(value.size); });
-    w.Bytes(region.data); w.Bytes(region.body);
-    w.Vector(region.relocations, [&](const auto& value) { w.Integer(value.offset); w.Integer(value.kind); w.Ref(value.target); });
-    w.Vector(region.blocks, [&](const auto& value) {
-        w.Ref(value.location); w.Integer(value.entry); w.Integer(value.size);
-        w.Vector(value.words, [&](const auto& word) { w.Ref(word.address); w.Integer(word.instruction); });
-    });
-    w.Vector(region.links, [&](const auto& value) { w.Ref(value.location); w.Integer(value.cell); w.Integer(value.fallback); });
-    w.Vector(region.faults, [&](const auto& value) { w.Integer(value.rip); w.Integer(value.resume); w.Integer(value.callback); });
-    const auto checksum = Hash(w.bytes);
+    if (region.blocks.empty() || region.prelude > region.capacity || region.body.size() > region.capacity - region.prelude ||
+        region.data_offset > region.prelude || region.data.size() > region.prelude - region.data_offset ||
+        region.data.size() > maximum_data_bytes)
+        throw std::runtime_error("Invalid A64 cache region layout");
+    Index index;
+    index.runtime_identity = region.runtime_identity; index.contract = region.contract; index.features = region.features;
+    index.capacity = region.capacity; index.prelude = region.prelude; index.data_offset = region.data_offset;
+    index.body_end = region.prelude + region.body.size(); index.images = region.images; index.hosts = region.hosts;
+    index.data_size = region.data.size(); index.data_checksum = Hash(region.data);
+    const auto sorted = [](const auto& values, auto offset) {
+        std::vector<std::size_t> order(values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return offset(values[a]) < offset(values[b]); });
+        return order;
+    };
+    const auto blocks = sorted(region.blocks, [](const auto& value) { return value.entry; });
+    const auto relocations = sorted(region.relocations, [](const auto& value) { return value.offset; });
+    const auto links = sorted(region.links, [](const auto& value) { return value.fallback; });
+    const auto faults = sorted(region.faults, [](const auto& value) { return value.rip; });
+    std::size_t relocation_cursor = 0, link_cursor = 0, fault_cursor = 0;
+    std::vector<Writer> records; records.reserve(blocks.size()); index.blocks.reserve(blocks.size());
+    auto block_end = region.prelude;
+    for (const auto ordinal : blocks) {
+        const auto& block = region.blocks[ordinal];
+        if (block.location.image >= region.images.size() || !block.size || block.entry < block_end ||
+            block.entry > index.body_end || block.size > index.body_end - block.entry ||
+            block.words.empty() || block.words.size() > 4096)
+            throw std::runtime_error("Invalid A64 cache block");
+        block_end = block.entry + block.size;
+        Writer w;
+        w.Ref(block.location); w.Integer(block.entry); w.Integer(block.size);
+        w.Vector(block.words, [&](const auto& word) { w.Ref(word.address); w.Integer(word.instruction); });
+        w.Bytes(std::span(region.body).subspan(block.entry - region.prelude, block.size));
+        const auto write_owned = [&](const auto& values, const auto& order, auto& cursor, auto offset, auto write) {
+            const auto begin = cursor;
+            while (cursor < order.size() && offset(values[order[cursor]]) < block_end) {
+                if (offset(values[order[cursor]]) < block.entry)
+                    throw std::runtime_error("A64 cache metadata has no owning block");
+                ++cursor;
+            }
+            w.Integer<std::uint64_t>(cursor - begin);
+            for (auto i = begin; i < cursor; ++i) write(values[order[i]]);
+        };
+        write_owned(region.relocations, relocations, relocation_cursor,
+            [](const auto& value) { return value.offset; },
+            [&](const auto& value) { w.Integer(value.offset); w.Integer(value.kind); w.Ref(value.target); });
+        write_owned(region.links, links, link_cursor,
+            [](const auto& value) { return value.fallback; },
+            [&](const auto& value) { w.Ref(value.location); w.Integer(value.cell); w.Integer(value.fallback); });
+        write_owned(region.faults, faults, fault_cursor,
+            [](const auto& value) { return value.rip; },
+            [&](const auto& value) { w.Integer(value.rip); w.Integer(value.resume); w.Integer(value.callback); });
+        index.blocks.push_back({block.location, block.entry, block.size, 0, w.bytes.size(), Hash(w.bytes)});
+        records.push_back(std::move(w));
+    }
+    if (relocation_cursor != relocations.size() || link_cursor != links.size() || fault_cursor != faults.size())
+        throw std::runtime_error("A64 cache metadata has no owning block");
+    auto encoded_index = EncodeIndex(index);
+    if (encoded_index.bytes.size() > maximum_index_bytes)
+        throw std::runtime_error("A64 cache index exceeds size limit");
+    index.data_file_offset = header_size + encoded_index.bytes.size();
+    auto record_offset = index.data_file_offset + index.data_size;
+    for (auto& block : index.blocks) {
+        block.record_offset = record_offset;
+        if (block.record_size > std::numeric_limits<std::uint64_t>::max() - record_offset)
+            throw std::runtime_error("A64 cache file exceeds size limit");
+        record_offset += block.record_size;
+    }
+    encoded_index = EncodeIndex(index);
     Writer header; header.bytes.insert(header.bytes.end(), magic.begin(), magic.end());
-    header.Integer<std::uint64_t>(w.bytes.size()); header.Integer(checksum);
+    header.Integer<std::uint64_t>(encoded_index.bytes.size()); header.Integer(Hash(encoded_index.bytes));
+    header.Integer(record_offset);
     static std::atomic<std::uint64_t> sequence{0};
     std::ostringstream suffix;
 #ifdef _WIN32
@@ -228,12 +451,14 @@ void Write(const std::filesystem::path& path, const Region& region) {
     try {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(header.bytes.data()), header.bytes.size());
-        output.write(reinterpret_cast<const char*>(w.bytes.data()), w.bytes.size());
+        output.write(reinterpret_cast<const char*>(encoded_index.bytes.data()), encoded_index.bytes.size());
+        output.write(reinterpret_cast<const char*>(region.data.data()), region.data.size());
+        for (const auto& record : records)
+            output.write(reinterpret_cast<const char*>(record.bytes.data()), record.bytes.size());
         output.close();
         if (!output) throw std::runtime_error("Cannot write A64 machine-code cache");
 #ifdef _WIN32
-        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-            throw std::runtime_error("Cannot publish A64 machine-code cache");
+        Publish(temporary, path);
 #else
         std::filesystem::rename(temporary, path);
 #endif
@@ -242,34 +467,62 @@ void Write(const std::filesystem::path& path, const Region& region) {
     }
 }
 
-Region Read(const std::filesystem::path& path, std::uint64_t maximum_bytes) {
-    const auto size = std::filesystem::file_size(path);
-    if (size < 24 || size > maximum_bytes) throw std::runtime_error("Invalid A64 machine-code cache size");
-    std::vector<std::uint8_t> bytes(size);
-    std::ifstream input(path, std::ios::binary);
-    input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
-    if (!input || !std::equal(magic.begin(), magic.end(), bytes.begin()))
-        throw std::runtime_error("Invalid A64 machine-code cache header");
-    Reader header{std::span(bytes).subspan(8)};
-    if (header.Integer<std::uint64_t>() != size - 24) throw std::runtime_error("Invalid A64 cache payload size");
-    const auto checksum = header.Integer<std::uint64_t>();
-    if (Hash(header.bytes) != checksum) throw std::runtime_error("Damaged A64 machine-code cache");
-    Reader r{header.bytes}; Region region;
-    region.runtime_identity = r.String(); region.contract = r.Integer<std::uint64_t>(); region.features = r.Integer<std::uint64_t>();
-    region.capacity = r.Integer<std::uint64_t>(); region.prelude = r.Integer<std::uint64_t>(); region.data_offset = r.Integer<std::uint64_t>();
-    region.images = r.Vector<std::string>([&] { return r.String(); });
-    region.hosts = r.Vector<HostImage>([&] { HostImage value; value.name = r.String(); value.identity = r.String(); value.size = r.Integer<std::uint64_t>(); return value; });
-    region.data = r.Bytes(); region.body = r.Bytes();
-    region.relocations = r.Vector<Relocation>([&] { Relocation value; value.offset = r.Integer<std::uint64_t>(); value.kind = r.Integer<std::uint8_t>(); value.target = r.Ref(); return value; });
-    region.blocks = r.Vector<Block>([&] {
-        Block value; value.location = r.Ref(); value.entry = r.Integer<std::uint64_t>(); value.size = r.Integer<std::uint64_t>();
-        value.words = r.Vector<Word>([&] { Word word; word.address = r.Ref(); word.instruction = r.Integer<std::uint32_t>(); return word; });
+Index ReadIndex(const std::filesystem::path& path, std::uint64_t maximum_bytes) {
+    return ReadFront(std::make_shared<File>(path), maximum_bytes);
+}
+
+std::vector<std::uint8_t> ReadData(const Index& index) {
+    if (!index.file) throw std::runtime_error("A64 cache file is not open");
+    auto bytes = index.file->Read(index.data_file_offset, index.data_size);
+    if (Hash(bytes) != index.data_checksum) throw std::runtime_error("Damaged A64 cache shared data");
+    return bytes;
+}
+
+BlockRecord ReadBlock(const Index& index, std::size_t ordinal) {
+    if (!index.file || ordinal >= index.blocks.size()) throw std::runtime_error("Invalid A64 cache block ordinal");
+    const auto& indexed = index.blocks[ordinal];
+    const auto bytes = index.file->Read(indexed.record_offset, indexed.record_size);
+    if (Hash(bytes) != indexed.record_checksum) throw std::runtime_error("Damaged A64 cache block record");
+    Reader r{bytes}; BlockRecord record; record.read_bytes = bytes.size();
+    auto& block = record.block;
+    block.location = r.Ref(); block.entry = r.Integer<std::uint64_t>(); block.size = r.Integer<std::uint64_t>();
+    if (block.location.image != indexed.location.image || block.location.offset != indexed.location.offset ||
+        block.location.flags != indexed.location.flags || block.entry != indexed.entry || block.size != indexed.size)
+        throw std::runtime_error("A64 cache block differs from index");
+    block.words = r.Vector<Word>([&] {
+        Word word; word.address = r.Ref(); word.instruction = r.Integer<std::uint32_t>();
+        if (word.address.image >= index.images.size()) throw std::runtime_error("Invalid A64 cache source image");
+        return word;
+    }, sizeof(std::uint32_t) * 2 + sizeof(std::uint64_t) * 2);
+    if (block.words.empty() || block.words.size() > 4096) throw std::runtime_error("Invalid A64 cache source words");
+    record.body = r.Bytes();
+    if (record.body.size() != block.size) throw std::runtime_error("Invalid A64 cache block body");
+    const auto contains = [&](std::uint64_t offset) { return offset >= block.entry && offset - block.entry < block.size; };
+    record.relocations = r.Vector<Relocation>([&] {
+        Relocation value; value.offset = r.Integer<std::uint64_t>(); value.kind = r.Integer<std::uint8_t>(); value.target = r.Ref();
+        if (!contains(value.offset) || sizeof(std::uint64_t) > block.size - (value.offset - block.entry) || value.kind > 5 ||
+            (value.kind == 0 && (value.target.image >= index.hosts.size() || value.target.offset >= index.hosts[value.target.image].size)) ||
+            ((value.kind == 1 || value.kind == 2 || value.kind == 5) && value.target.image >= index.images.size()))
+            throw std::runtime_error("Invalid A64 cache relocation");
         return value;
-    });
-    region.links = r.Vector<Link>([&] { Link value; value.location = r.Ref(); value.cell = r.Integer<std::uint64_t>(); value.fallback = r.Integer<std::uint64_t>(); return value; });
-    region.faults = r.Vector<Fault>([&] { Fault value; value.rip = r.Integer<std::uint64_t>(); value.resume = r.Integer<std::uint64_t>(); value.callback = r.Integer<std::uint64_t>(); return value; });
-    if (!r.bytes.empty()) throw std::runtime_error("Trailing A64 machine-code cache data");
-    return region;
+    }, sizeof(std::uint8_t) + sizeof(std::uint32_t) + sizeof(std::uint64_t) * 3);
+    record.links = r.Vector<Link>([&] {
+        Link value; value.location = r.Ref(); value.cell = r.Integer<std::uint64_t>(); value.fallback = r.Integer<std::uint64_t>();
+        if (value.location.image >= index.images.size() || !contains(value.fallback) || value.cell < index.data_offset ||
+            value.cell - index.data_offset > index.data_size || sizeof(std::uint64_t) > index.data_size - (value.cell - index.data_offset) ||
+            value.cell % alignof(std::uint64_t))
+            throw std::runtime_error("Invalid A64 cache link");
+        return value;
+    }, sizeof(std::uint32_t) + sizeof(std::uint64_t) * 4);
+    record.faults = r.Vector<Fault>([&] {
+        Fault value; value.rip = r.Integer<std::uint64_t>(); value.resume = r.Integer<std::uint64_t>(); value.callback = r.Integer<std::uint64_t>();
+        const bool prelude_callback = value.callback >= index.data_offset + index.data_size && value.callback < index.prelude;
+        if (!contains(value.rip) || (value.resume && !contains(value.resume)) || (!prelude_callback && !contains(value.callback)))
+            throw std::runtime_error("Invalid A64 cache fastmem fault");
+        return value;
+    }, sizeof(std::uint64_t) * 3);
+    if (!r.bytes.empty()) throw std::runtime_error("Trailing A64 cache block data");
+    return record;
 }
 
 void Trim(const std::filesystem::path& directory, std::uint64_t maximum_bytes) {
@@ -283,8 +536,12 @@ void Trim(const std::filesystem::path& directory, std::uint64_t maximum_bytes) {
     std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
     for (const auto& file : files) {
         if (total <= maximum_bytes) break;
+#ifdef _WIN32
+        if (Remove(file.path)) total -= file.size;
+#else
         std::error_code error;
         if (std::filesystem::remove(file.path, error)) total -= file.size;
+#endif
     }
 }
 } // namespace Dynarmic::A64::Persistent
